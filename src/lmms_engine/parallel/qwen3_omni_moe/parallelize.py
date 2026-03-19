@@ -3,17 +3,11 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.utils
 from loguru import logger
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ParallelStyle,
-    PrepareModuleInput,
-    PrepareModuleInputOutput,
-    parallelize_module,
-)
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.parallel import parallelize_module
 from tqdm import tqdm
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -21,30 +15,35 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 import lmms_engine.parallel.process_group_manager as pgm
-from lmms_engine.models.qwen3_omni_moe.qwen3_omni_moe_experts import Qwen3OmniMoeExperts
 from lmms_engine.utils.fsdp2_utils import fsdp2_load_full_state_dict
+from lmms_engine.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from .style import Qwen3OmniMoeParallelStyle
+
+_IS_TRANSFORMERS_5 = is_transformers_version_greater_or_equal_to("5.0")
 
 if TYPE_CHECKING:
     from lmms_engine.train.config import TrainingArguments
 
 
 def stack_expert_params_qwen3_omni_moe(model: Qwen3OmniMoeThinkerForConditionalGeneration) -> None:
+    """Stack individual expert nn.Linear weights into fused Parameters (transformers < 5.0 only)."""
+    from lmms_engine.models.qwen3_omni_moe.qwen3_omni_moe_experts import (
+        Qwen3OmniMoeExperts,
+    )
+
     logger.info("Stacking expert parameters for Qwen3-Omni MoE model")
 
     with torch.no_grad():
         for decoder_layer in tqdm(
             model.model.layers, desc="Stacking expert parameters", disable=not dist.get_rank() == 0
         ):
-            # Check if this layer has MoE structure
             if not isinstance(decoder_layer.mlp, Qwen3OmniMoeThinkerTextSparseMoeBlock):
                 continue
 
             if not hasattr(decoder_layer.mlp, "experts"):
                 continue
 
-            # Get expert configuration from the first expert
             first_expert = decoder_layer.mlp.experts[0]
             num_experts = len(decoder_layer.mlp.experts)
             hidden_dim = first_expert.down_proj.weight.size(0)
@@ -178,7 +177,8 @@ def apply_qwen3_omni_moe_parallelize_fn(
     **kwargs,
 ):
     ep_size = pgm.process_group_manager.ep_size
-    stack_expert_params_qwen3_omni_moe(model)
+    if not _IS_TRANSFORMERS_5:
+        stack_expert_params_qwen3_omni_moe(model)
     full_state_dict = model.state_dict()
     if ep_size > 1:
         ep_mesh = pgm.process_group_manager.device_mesh["dp_shard_in_ep"]

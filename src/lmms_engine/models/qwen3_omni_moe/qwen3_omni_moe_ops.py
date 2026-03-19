@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch.distributed.tensor import DTensor
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
@@ -20,6 +21,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     apply_rotary_pos_emb,
     rotate_half,
 )
+
+from lmms_engine.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+_IS_TRANSFORMERS_5 = is_transformers_version_greater_or_equal_to("5.0")
+if _IS_TRANSFORMERS_5:
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerTextExperts
 from transformers.utils import is_flash_attn_2_available
 
 from lmms_engine.parallel.sequence_parallel.ulysses import (
@@ -351,14 +358,6 @@ def attn_forward(
 
 
 def moe_sparse_layer_forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    import torch.nn.functional as F
-
-    gate = _get_module_attr(self, "gate")
-    num_experts = gate.out_features
-    num_experts_per_tok = _get_module_attr(self, "num_experts_per_tok")
-    norm_topk_prob = _get_module_attr(self, "norm_topk_prob")
-
-    # Handle both 3D [batch, seq, hidden] and 1D [total_tokens, hidden] inputs
     is_3d = hidden_states.ndim == 3
     if is_3d:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -366,36 +365,45 @@ def moe_sparse_layer_forward(self, hidden_states: torch.Tensor, **kwargs) -> Tup
     else:
         hidden_dim = hidden_states.shape[-1]
 
-    router_logits = self.gate(hidden_states)
+    gate = _get_module_attr(self, "gate")
+    if hasattr(gate, "num_experts"):
+        # transformers >= 5.0: TopKRouter
+        num_experts = gate.num_experts
+        top_k = gate.top_k
+        router_logits, routing_weights, selected_experts = gate(hidden_states)
+    else:
+        # transformers < 5.0: nn.Linear gate
+        num_experts = gate.out_features
+        try:
+            top_k = _get_module_attr(self, "num_experts_per_tok")
+        except AttributeError:
+            top_k = _get_module_attr(self, "top_k")
+        norm_topk_prob = _get_module_attr(self, "norm_topk_prob")
+        router_logits = gate(hidden_states)
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, num_experts_per_tok, dim=-1)
-
-    # Convert to float32 for histogram
     selected_experts = selected_experts.to(torch.float32)
-
-    if norm_topk_prob:
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-    routing_weights = routing_weights.to(hidden_states.dtype)
-
     num_tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
     selected_experts = selected_experts.to(torch.int64)
     num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
 
-    # tokens need to be reordered so all tokens for expert_0 come first,then expert_1, etc.
     token_indices_experts_sorted = torch.argsort(selected_experts.view(-1), stable=True)
-
     top_scores_experts_sorted = routing_weights.view(-1)[token_indices_experts_sorted]
-    token_indices_experts_sorted = token_indices_experts_sorted // num_experts_per_tok
+    token_indices_experts_sorted = token_indices_experts_sorted // top_k
     token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1, 1).expand(-1, hidden_dim)
 
     routed_input = torch.gather(hidden_states, dim=0, index=token_indices_experts_sorted)
 
     # Check if EP is enabled by checking if expert params are DTensors
-    from torch.distributed._tensor import DTensor
-
-    if isinstance(self.experts.gate_proj, DTensor):
+    # >= 5.0 uses gate_up_proj (fused), < 5.0 uses gate_proj (separate)
+    expert_param = getattr(self.experts, "gate_up_proj", None)
+    if expert_param is None:
+        expert_param = getattr(self.experts, "gate_proj", None)
+    if isinstance(expert_param, DTensor):
         # EP is enabled - ParallelStyle._input_fn will handle the split
         out_experts_split = self.experts(routed_input, num_tokens_per_expert)
     else:
@@ -411,8 +419,33 @@ def moe_sparse_layer_forward(self, hidden_states: torch.Tensor, **kwargs) -> Tup
     final_hidden_states = torch.zeros_like(hidden_states)
     final_hidden_states = final_hidden_states.scatter_add(dim=0, index=token_indices_experts_sorted, src=routed_output)
 
-    # If input was 3D, reshape back
     if is_3d:
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
     return final_hidden_states, router_logits
+
+
+def experts_forward(self, *routed_input):
+    if len(routed_input) == 2 and routed_input[1].ndim == 1:
+        routed_input = torch.split(
+            routed_input[0],
+            split_size_or_sections=routed_input[1].tolist(),
+            dim=0,
+        )
+
+    out_experts_split = []
+    if isinstance(self.down_proj, DTensor):
+        down_proj = self.down_proj.to_local()
+        gate_up_proj = self.gate_up_proj.to_local()
+    else:
+        down_proj = self.down_proj
+        gate_up_proj = self.gate_up_proj
+
+    for idx, x in enumerate(routed_input):
+        gate_up = torch.nn.functional.linear(x, gate_up_proj[idx])
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = self.act_fn(gate) * up
+        hidden = torch.nn.functional.linear(hidden, down_proj[idx])
+        out_experts_split.append(hidden)
+
+    return torch.cat(out_experts_split, dim=0)

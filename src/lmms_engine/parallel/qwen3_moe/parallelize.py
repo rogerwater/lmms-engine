@@ -3,37 +3,30 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.utils
 from loguru import logger
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ParallelStyle,
-    PrepareModuleInput,
-    PrepareModuleInputOutput,
-    parallelize_module,
-)
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.parallel import parallelize_module
 from tqdm import tqdm
 from transformers import Qwen3MoeForCausalLM
-from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-    Qwen3MoeAttention,
-    Qwen3MoeMLP,
-    Qwen3MoeRMSNorm,
-    Qwen3MoeSparseMoeBlock,
-)
 
 import lmms_engine.parallel.process_group_manager as pgm
-from lmms_engine.models.qwen3_moe.qwen3_moe_experts import Qwen3MoeExperts
 from lmms_engine.utils.fsdp2_utils import fsdp2_load_full_state_dict
+from lmms_engine.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from .style import Qwen3MoeParallelStyle
+
+_IS_TRANSFORMERS_5 = is_transformers_version_greater_or_equal_to("5.0")
 
 if TYPE_CHECKING:
     from lmms_engine.train.config import TrainingArguments
 
 
 def stack_expert_params(model: Qwen3MoeForCausalLM) -> None:
+    """Stack individual expert nn.Linear weights into fused Parameters (transformers < 5.0 only)."""
+    from lmms_engine.models.qwen3_moe.qwen3_moe_experts import Qwen3MoeExperts
+
     logger.info("Stacking expert parameters for Qwen3Moe model")
     with torch.no_grad():
         for decoder_layer in tqdm(
@@ -147,7 +140,8 @@ def apply_qwen3_moe_parallelize_fn(
     **kwargs,
 ):
     ep_size = pgm.process_group_manager.ep_size
-    stack_expert_params(model)
+    if not _IS_TRANSFORMERS_5:
+        stack_expert_params(model)
     full_state_dict = model.state_dict()
     if ep_size > 1:
         ep_mesh = pgm.process_group_manager.device_mesh["ep"]
