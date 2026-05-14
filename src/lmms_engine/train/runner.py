@@ -70,6 +70,7 @@ class TrainRunner:
             model_class = create_model_from_pretrained(
                 load_from_pretrained_path,
                 model_general_type=self.model_config.model_general_type,
+                trust_remote_code=bool(model_kwargs.get("trust_remote_code", False)),
             )
             model = model_class.from_pretrained(
                 load_from_pretrained_path,
@@ -107,6 +108,9 @@ class TrainRunner:
             kwargs["patch_type"].append("liger")
             # Overwrite the use_liger_kernel to False as we already apply the liger kernel by ourselves
             self.config.trainer_args.use_liger_kernel = False
+
+        if self.config.trainer_args.use_rmpad:
+            kwargs["patch_type"].append("rmpad")
 
         if self.model_config.monkey_patch_kwargs:
             patch_type = getattr(self.model_config.monkey_patch_kwargs, "patch_type", [])
