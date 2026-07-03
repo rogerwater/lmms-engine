@@ -26,6 +26,7 @@ from lmms_engine.parallel.sequence_parallel.ulysses import (
 )
 from lmms_engine.train.hf import Trainer
 from lmms_engine.utils.compute_tracker import ComputeTracker
+from lmms_engine.utils.device_utils import is_npu_available
 
 from ..utils.train_utils import TrainUtilities
 from .config import TrainerConfig
@@ -141,10 +142,14 @@ class TrainRunner:
         # Setting random seed for all
         random.seed(random_seed)
         torch.manual_seed(random_seed)
-        torch.cuda.manual_seed(random_seed)
-        torch.cuda.manual_seed_all(random_seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if is_npu_available():
+            torch.npu.manual_seed(random_seed)
+            torch.npu.manual_seed_all(random_seed)
+        elif torch.cuda.is_available():
+            torch.cuda.manual_seed(random_seed)
+            torch.cuda.manual_seed_all(random_seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         np.random.seed(random_seed)
         logger.info(f"Set random seed to {random_seed}")
         return random_seed
@@ -222,7 +227,10 @@ class TrainRunner:
     def safe_save_model_for_hf_trainer(self, trainer: Trainer, output_dir: str):
         """Collects the state dict and dump to disk."""
         trainer.accelerator.wait_for_everyone()
-        torch.cuda.synchronize()
+        if is_npu_available():
+            torch.npu.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
         check_only_save_mm_adapter = self.config.trainer_args.only_save_mm_adapter
         logger.info(f"Only save projectors: {check_only_save_mm_adapter}")
 

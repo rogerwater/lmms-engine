@@ -9,6 +9,7 @@ from loguru import logger
 from torch.distributed import ProcessGroup
 from transformers import AutoProcessor
 
+from lmms_engine.utils.device_utils import get_device_name
 from lmms_engine.utils.import_utils import is_torch_npu_available
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
@@ -131,7 +132,7 @@ class TrainUtilities:
                 ptr += 1
             return number
 
-        device_name = torch.cuda.get_device_name()
+        device_name = get_device_name()
         flops = float("inf")  # INF flops for unkown gpu type
 
         if "B200" in device_name:
@@ -158,7 +159,7 @@ class TrainUtilities:
     @staticmethod
     def get_device_tdp() -> float:
         """Return TDP (watts) for the current GPU. 0.0 if unknown."""
-        device_name = torch.cuda.get_device_name()
+        device_name = get_device_name()
         if "MI300X" in device_name:
             return 750.0
         elif "B200" in device_name:

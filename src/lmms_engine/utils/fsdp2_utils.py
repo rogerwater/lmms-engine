@@ -19,6 +19,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LinearLR
 
 import lmms_engine.parallel.process_group_manager as pgm
+from lmms_engine.utils.device_utils import get_current_device
 
 
 def apply_fsdp2(model, fsdp_kwargs, fsdp_transformer_layer_cls_to_wrap=None):
@@ -91,11 +92,12 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
             set_model_state_dict,
         )
 
-        # To broadcast, it needs to be instantiated in the GPU.
+        # To broadcast, it needs to be instantiated on the accelerator.
+        current_device = get_current_device()
         if dist.get_rank() == 0:
-            model = model.to(device=torch.cuda.current_device(), non_blocking=True)
+            model = model.to(device=current_device, non_blocking=True)
         else:
-            model = model.to_empty(device=torch.cuda.current_device())
+            model = model.to_empty(device=current_device)
 
         cpu_offload = cpu_offload is not None
         options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=True)
@@ -108,7 +110,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, device_
         if cpu_offload:
             model.to("cpu", non_blocking=True)
             for buf in model.buffers():
-                buf.data = buf.data.to(torch.cuda.current_device())
+                buf.data = buf.data.to(current_device)
 
 
 """
@@ -250,7 +252,8 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     if not pgm.process_group_manager.enable_parallel:
         grads = [p.grad for p in parameters if p.grad is not None]
         total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-        total_norm = total_norm.to(torch.cuda.current_device(), non_blocking=True)
+        current_device = get_current_device()
+        total_norm = total_norm.to(current_device, non_blocking=True)
         _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
         return total_norm
     else:
@@ -275,7 +278,7 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
             grads = [p.grad for p in mesh_params]
             if grads:
                 mesh_total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-                mesh_total_norm = mesh_total_norm.to(torch.cuda.current_device(), non_blocking=True)
+                mesh_total_norm = mesh_total_norm.to(get_current_device(), non_blocking=True)
                 _clip_grads_with_norm_(mesh_params, max_norm, mesh_total_norm, foreach)
                 total_norms.append(mesh_total_norm)
 
@@ -284,7 +287,7 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
             grads = [p.grad for p in non_dtensor_params]
             if grads:
                 non_dtensor_total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
-                non_dtensor_total_norm = non_dtensor_total_norm.to(torch.cuda.current_device(), non_blocking=True)
+                non_dtensor_total_norm = non_dtensor_total_norm.to(get_current_device(), non_blocking=True)
                 _clip_grads_with_norm_(non_dtensor_params, max_norm, non_dtensor_total_norm, foreach)
                 total_norms.append(non_dtensor_total_norm)
 
@@ -301,15 +304,15 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
                     max_norm = 0.0
                     for norm in total_norms:
                         max_norm = max(max_norm, norm.item())
-                    return torch.tensor(max_norm, device=torch.cuda.current_device())
+                    return torch.tensor(max_norm, device=get_current_device())
                 else:
                     # For other norms, sum the powered norms then take the root
                     for norm in total_norms:
                         total_norm_sum += norm.item() ** norm_type
                     return torch.tensor(
                         total_norm_sum ** (1.0 / norm_type),
-                        device=torch.cuda.current_device(),
+                        device=get_current_device(),
                     )
         else:
             # No gradients found, return zero norm
-            return torch.tensor(0.0, device=torch.cuda.current_device())
+            return torch.tensor(0.0, device=get_current_device())

@@ -26,6 +26,7 @@ from lmms_engine.parallel.parallelize import MODEL_TO_PARALLEL_METHOD, apply_par
 from lmms_engine.train.config import TrainingArguments
 from lmms_engine.train.registry import TRAINER_REGISTER
 from lmms_engine.utils import ComputeTracker, TrainUtilities
+from lmms_engine.utils.device_utils import empty_cache, get_accelerator_type, get_current_device, get_device_name
 from lmms_engine.utils.ema_utils import EMAHelper
 from lmms_engine.utils.fsdp2_utils import (
     apply_fsdp2,
@@ -197,7 +198,7 @@ class FSDP2SFTTrainer:
 
         del full_state
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache()
 
     def prepare_optimizer(self):
         self.optimizer = torch.optim.AdamW(
@@ -242,7 +243,7 @@ class FSDP2SFTTrainer:
             cast_dtype = torch.bfloat16
         else:
             cast_dtype = torch.float16
-        with torch.autocast(device_type="cuda", dtype=cast_dtype):
+        with torch.autocast(device_type=get_accelerator_type(), dtype=cast_dtype):
             outputs = self.model(**batch)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return loss
@@ -275,7 +276,7 @@ class FSDP2SFTTrainer:
 
         # reduce loss across dp ranks
         lr = self.scheduler.get_last_lr()[0]
-        loss_item = torch.tensor(loss_item, device=self.args.device)
+        loss_item = torch.tensor(loss_item, device=get_current_device())
         torch.distributed.all_reduce(loss_item, op=torch.distributed.ReduceOp.AVG)
         metrics = {
             "train/loss": loss_item.item(),
@@ -340,7 +341,7 @@ class FSDP2SFTTrainer:
             num_gpus=world_size,
             carbon_intensity=getattr(self.args, "carbon_intensity", 0.475) or 0.475,
             gpu_tdp_watts=TrainUtilities.get_device_tdp(),
-            gpu_name=torch.cuda.get_device_name(),
+            gpu_name=get_device_name(),
         )
         self.compute_tracker.start()
         loaded_checkpoint_dir: Optional[str] = None
@@ -651,7 +652,7 @@ class FSDP2SFTTrainer:
 
     def empty_cache(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache()
 
     def print_batch_input(self, batch):
         if self.args.print_batch_input_steps > 0 and self.global_step % self.args.print_batch_input_steps == 0:
