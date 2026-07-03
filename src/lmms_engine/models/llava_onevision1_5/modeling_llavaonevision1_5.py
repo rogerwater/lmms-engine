@@ -62,9 +62,18 @@ from .configuration_llavaonevision1_5 import (
     RiceConfig,
 )
 
+flash_attn_varlen_func = None
+_flash_attention_forward = None
 if is_flash_attn_available():
-    from flash_attn import flash_attn_varlen_func
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    try:
+        from flash_attn import flash_attn_varlen_func
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    except ImportError:
+        # Some non-CUDA environments can report flash-attn as available from
+        # package metadata, while importing the compiled extension still fails.
+        # Keep import-time optional so unrelated models (e.g. NanoVLM on NPU)
+        # are not blocked.
+        pass
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask

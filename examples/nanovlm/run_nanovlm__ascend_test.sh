@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"
 export HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-1800}"
 export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"
@@ -10,16 +10,16 @@ export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONUNBUFFERED=1
-export HF_HOME="${HF_HOME:-/data/hf_cache}"
-export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+export HF_HOME="${HF_HOME:-/home/ma-user/work/hf_cache}"
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 
-DATASET_PATH="${DATASET_PATH:-/data/lmms_engine_test/nanovlm_test.yaml}"
-PROCESSOR_NAME="${PROCESSOR_NAME:-/data/models/NanoVLM_Init}"
-MODEL_PATH="${MODEL_PATH:-/data/models/NanoVLM_Init}"
+DATASET_PATH="${DATASET_PATH:-/home/ma-user/work/dataset/lmms_engine_test_nanovlm/nanovlm_test.yaml}"
+PROCESSOR_NAME="${PROCESSOR_NAME:-/home/ma-user/work/model/NanoVLM_Init}"
+MODEL_PATH="${MODEL_PATH:-/home/ma-user/work/model/NanoVLM_Init}"
 
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-8000}"
 
@@ -30,11 +30,11 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 LEARNING_RATE="${LEARNING_RATE:-2.0e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-MAX_STEPS="${MAX_STEPS:-20}"
+MAX_STEPS="${MAX_STEPS:-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 
 RUN_NAME="${RUN_NAME:-nanovlm_ascend_test}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/output/nanovlm_ascend_test}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/ma-user/work/output/nanovlm_ascend_test}"
 
 torchrun --nproc_per_node="${NPROC_PER_NODE}" \
   --nnodes=1 \

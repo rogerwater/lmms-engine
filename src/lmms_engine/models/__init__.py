@@ -76,11 +76,6 @@ __all__ = [
 if not is_transformers_5:
     from .dream_dllm import DreamDLLMConfig, DreamDLLMForMaskedLM
     from .llada_dllm import LLaDADLLMConfig, LLaDADLLMForMaskedLM
-    from .llava_onevision1_5 import (
-        LLaVAOneVision1_5_ForConditionalGeneration,
-        Llavaonevision1_5Config,
-        apply_liger_kernel_to_llava_onevision1_5,
-    )
     from .qwen3_dllm import Qwen3DLLMConfig, Qwen3DLLMForMaskedLM
 
     __all__.extend(
@@ -91,8 +86,25 @@ if not is_transformers_5:
             "DreamDLLMForMaskedLM",
             "LLaDADLLMConfig",
             "LLaDADLLMForMaskedLM",
-            "Llavaonevision1_5Config",
-            "LLaVAOneVision1_5_ForConditionalGeneration",
-            "apply_liger_kernel_to_llava_onevision1_5",
         ]
     )
+
+    try:
+        from .llava_onevision1_5 import (
+            LLaVAOneVision1_5_ForConditionalGeneration,
+            Llavaonevision1_5Config,
+            apply_liger_kernel_to_llava_onevision1_5,
+        )
+
+        __all__.extend(
+            [
+                "Llavaonevision1_5Config",
+                "LLaVAOneVision1_5_ForConditionalGeneration",
+                "apply_liger_kernel_to_llava_onevision1_5",
+            ]
+        )
+    except ImportError:
+        # LLaVA-OneVision-1.5 is optional for NanoVLM and can require CUDA-only
+        # optional packages such as flash-attn. Do not make importing
+        # lmms_engine.models fail on Ascend/NPU environments.
+        pass
