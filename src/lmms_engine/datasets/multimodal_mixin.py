@@ -13,7 +13,6 @@ import torch.distributed as dist
 import torchvision.io
 from datasets import Dataset as HFDataset
 from datasets import load_dataset, load_from_disk
-from decord import VideoReader, cpu
 from loguru import logger
 from PIL import Image
 from tqdm import tqdm
@@ -164,6 +163,15 @@ class MultiModalDataLoadingMixin:
         Returns:
             Tuple of (video frames, sample fps)
         """
+        try:
+            from decord import VideoReader, cpu
+        except ImportError as exc:
+            raise ImportError(
+                "The 'decord' package is required only when video_backend='decord' "
+                "or when object-storage videos are decoded through the decord path. "
+                "Install it with `pip install decord`, or use a non-decord video backend."
+            ) from exc
+
         if isinstance(video_path, str) or isinstance(video_path, BytesIO):
             vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
         elif isinstance(video_path, list):
