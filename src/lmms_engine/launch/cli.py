@@ -6,6 +6,7 @@ import shutil
 from copy import deepcopy
 
 import hydra
+import torch
 import torch.distributed as dist
 import transformers
 import yaml
@@ -19,6 +20,20 @@ from ..datasets import DatasetConfig
 from ..eval import EvalConfig
 from ..models import ModelConfig
 from ..train import TrainerConfig, TrainingArguments, TrainRunner
+
+
+def _setup_npu_device_if_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        return False
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.npu.set_device(local_rank)
+    return True
 
 
 def filter_training_args(kwargs: dict) -> dict:
@@ -69,7 +84,15 @@ def create_train_task(config):
 
     # For now, we haven't implemented pp.
     use_cpu = trainer_args.get("use_cpu", False)
-    backend = "gloo" if use_cpu else "nccl"
+    use_npu = _setup_npu_device_if_available() if not use_cpu else False
+    backend = trainer_args.get("ddp_backend")
+    if backend is None:
+        if use_cpu:
+            backend = "gloo"
+        elif use_npu:
+            backend = "hccl"
+        else:
+            backend = "nccl"
     # If the process group is already initialized, don't initialize it again
     ddp_timeout = trainer_args.get("ddp_timeout", 30 * 60)
     if not dist.is_initialized():

@@ -22,6 +22,7 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-8000}"
+DDP_BACKEND="${DDP_BACKEND:-hccl}"
 
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -68,6 +69,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" \
   trainer_args.warmup_ratio="${WARMUP_RATIO}" \
   trainer_args.run_name="${RUN_NAME}" \
   trainer_args.output_dir="${OUTPUT_DIR}" \
+  trainer_args.ddp_backend="${DDP_BACKEND}" \
   trainer_args.fsdp2=true \
   trainer_args.max_steps="${MAX_STEPS}" \
   trainer_args.save_steps="${MAX_STEPS}" \
