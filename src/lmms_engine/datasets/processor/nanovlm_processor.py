@@ -18,11 +18,17 @@ class NanovlmDataProcessor:
         self.config = config
 
     def build(self):
-        self._tokenizer = AutoTokenizer.from_pretrained(self.config.processor_name)
+        self._tokenizer = self._from_pretrained_with_mistral_regex_fix(
+            AutoTokenizer,
+            self.config.processor_name,
+        )
 
         # Load image processor from the same local/remote checkpoint as tokenizer.
         # `NanoVLM_init` now carries both tokenizer and preprocessor configs.
-        loaded_processor = AutoProcessor.from_pretrained(self.config.processor_name)
+        loaded_processor = self._from_pretrained_with_mistral_regex_fix(
+            AutoProcessor,
+            self.config.processor_name,
+        )
         self.image_processor = getattr(loaded_processor, "image_processor", loaded_processor)
 
         self.image_token = self.config.extra_kwargs.get("image_token", "<|image_pad|>")
@@ -38,6 +44,13 @@ class NanovlmDataProcessor:
             video_token=self.video_token,
             batch_decode=self._tokenizer.batch_decode,
         )
+
+    @staticmethod
+    def _from_pretrained_with_mistral_regex_fix(auto_cls, pretrained_name_or_path):
+        try:
+            return auto_cls.from_pretrained(pretrained_name_or_path, fix_mistral_regex=True)
+        except TypeError:
+            return auto_cls.from_pretrained(pretrained_name_or_path)
 
     @property
     def special_tokens(self):

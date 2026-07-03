@@ -18,6 +18,14 @@ from lmms_engine.models import *
 
 CheckpointType = Literal["regular", "ema"]
 
+
+def _auto_processor_from_pretrained(path):
+    try:
+        return AutoProcessor.from_pretrained(path, fix_mistral_regex=True)
+    except TypeError:
+        return AutoProcessor.from_pretrained(path)
+
+
 # Mapping from checkpoint type to subdirectory name
 STATE_DICT_DIRNAME_MAP: dict[CheckpointType, str] = {
     "regular": "pytorch_model_fsdp_0",
@@ -387,7 +395,7 @@ class FSDP2Merger(CheckpointMerger):
             model = model_cls.from_config(config)
         model.load_state_dict(full_state_dict, assign=True)
         self.maybe_tie_weights(model, config, full_state_dict)
-        processor = AutoProcessor.from_pretrained(checkpoint_path)
+        processor = _auto_processor_from_pretrained(checkpoint_path)
         processor.save_pretrained(output_path)
         config.save_pretrained(output_path)
         # Save merged checkpoint
