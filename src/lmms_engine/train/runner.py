@@ -25,8 +25,8 @@ from lmms_engine.parallel.sequence_parallel.ulysses import (
     set_ulysses_sequence_parallel_group,
 )
 from lmms_engine.train.hf import Trainer
+from lmms_engine.accelerator import is_npu_available
 from lmms_engine.utils.compute_tracker import ComputeTracker
-from lmms_engine.utils.device_utils import is_npu_available
 
 from ..utils.train_utils import TrainUtilities
 from .config import TrainerConfig

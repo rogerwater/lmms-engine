@@ -9,7 +9,7 @@ from loguru import logger
 from torch.distributed import ProcessGroup
 from transformers import AutoProcessor
 
-from lmms_engine.utils.device_utils import get_device_name
+from lmms_engine.accelerator import get_accelerator_type, get_device_name
 from lmms_engine.utils.import_utils import is_torch_npu_available
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
@@ -473,14 +473,7 @@ class TrainUtilities:
     @staticmethod
     def get_device_type() -> str:
         """Get device type based on current machine, currently only support CPU, CUDA, NPU."""
-        if IS_CUDA_AVAILABLE:
-            device = "cuda"
-        elif IS_NPU_AVAILABLE:
-            device = "npu"
-        else:
-            device = "cpu"
-
-        return device
+        return get_accelerator_type()
 
     @staticmethod
     def all_reduce(

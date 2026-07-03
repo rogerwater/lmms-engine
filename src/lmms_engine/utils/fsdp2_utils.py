@@ -19,7 +19,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LinearLR
 
 import lmms_engine.parallel.process_group_manager as pgm
-from lmms_engine.utils.device_utils import get_current_device
+from lmms_engine.accelerator import get_current_device
 
 
 def apply_fsdp2(model, fsdp_kwargs, fsdp_transformer_layer_cls_to_wrap=None):

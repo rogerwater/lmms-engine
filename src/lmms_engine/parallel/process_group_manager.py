@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from lmms_engine.accelerator import get_accelerator_type
+
 
 class ProcessGroupManager:
     def __init__(self, tp_size, cp_size, pp_size, dp_size, ep_size=1, hsdp_shard_size=0):
@@ -58,9 +60,10 @@ class ProcessGroupManager:
         self.pp_size = pp_size
         self.dp_size = dp_size
         self.ep_size = ep_size
+        self.device_type = get_accelerator_type()
 
         self.device_mesh = init_device_mesh(
-            "cuda",
+            self.device_type,
             (dp_size, pp_size, cp_size, tp_size),
             mesh_dim_names=["dp", "pp", "cp", "tp"],
         )
@@ -74,7 +77,7 @@ class ProcessGroupManager:
             dp_shard_mod_ep = self.dp_size * self.cp_size * self.tp_size // self.ep_size
             dp_shard_in_ep = self.ep_size // (self.cp_size * self.tp_size)
             self.device_mesh = init_device_mesh(
-                "cuda",
+                self.device_type,
                 (dp_shard_mod_ep, dp_shard_in_ep),
                 mesh_dim_names=["dp_shard_mod_ep", "dp_shard_in_ep"],
             )
@@ -94,7 +97,7 @@ class ProcessGroupManager:
             fsdp_total = dp_size * cp_size
             replicate_size = fsdp_total // self.hsdp_shard_size
             self.hsdp_mesh = init_device_mesh(
-                "cuda",
+                self.device_type,
                 (replicate_size, self.hsdp_shard_size),
                 mesh_dim_names=("hsdp_replicate", "hsdp_shard"),
             )
