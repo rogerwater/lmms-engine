@@ -185,10 +185,54 @@ class NanovlmDataProcessor:
         return expanded_encode_id, len(video_pos)
 
     def _apply_chat_template(self, messages, tokenize: bool = False):
+        messages = [self._render_visual_content_for_template(message) for message in messages]
         result = self._tokenizer.apply_chat_template(messages, tokenize=tokenize)
         if isinstance(result, list) and result and isinstance(result[0], list):
             return result[0]
         return result
+
+    def _render_visual_content_for_template(self, message):
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            return message
+
+        explicit_image_tokens = 0
+        explicit_video_tokens = 0
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+            else:
+                text = str(item)
+            if isinstance(text, str):
+                explicit_image_tokens += text.count(self.image_token)
+                explicit_video_tokens += text.count(self.video_token)
+
+        rendered = []
+        for item in content:
+            if not isinstance(item, dict):
+                rendered.append(str(item))
+                continue
+
+            item_type = item.get("type")
+            if item_type == "image":
+                if explicit_image_tokens > 0:
+                    explicit_image_tokens -= 1
+                else:
+                    rendered.append(self.image_token)
+            elif item_type == "video":
+                if explicit_video_tokens > 0:
+                    explicit_video_tokens -= 1
+                else:
+                    rendered.append(self.video_token)
+            elif item_type == "text":
+                rendered.append(item.get("text", ""))
+            elif "text" in item:
+                rendered.append(item.get("text", ""))
+
+        return {
+            **message,
+            "content": "\n".join(part for part in rendered if part),
+        }
 
     def _prepare_visual_inputs(
         self,

@@ -63,6 +63,7 @@ class FSDP2SFTTrainer:
         self.eval_dataset = eval_dataset
         self.processing_class = processing_class
         self.data_collator = data_collator
+        self._sync_nanovlm_image_token_id()
         self.default_backend = []
         if "wandb" in self.args.report_to:
             self.default_backend.append("wandb")
@@ -115,6 +116,21 @@ class FSDP2SFTTrainer:
                 eval_config=self.args.eval_config,
             )
             assert self.args.eval_steps == self.args.save_steps, "eval_steps must be equal to save_steps"
+
+    def _sync_nanovlm_image_token_id(self) -> None:
+        model_type = getattr(getattr(self.model, "config", None), "model_type", None)
+        if model_type != "nanovlm" or self.processing_class is None:
+            return
+        image_token_id = getattr(self.processing_class, "image_token_id", None)
+        if image_token_id is None:
+            return
+        current_image_token_id = getattr(self.model.config, "image_token_id", None)
+        if current_image_token_id != image_token_id:
+            logger.warning(
+                f"Updating NanoVLM image_token_id from {current_image_token_id} to {image_token_id} "
+                "to match the tokenizer."
+            )
+            self.model.config.image_token_id = image_token_id
 
     def prepare_dataloader(self, dataset: DatasetType, is_training: bool = True):
         data_collator = self.data_collator
