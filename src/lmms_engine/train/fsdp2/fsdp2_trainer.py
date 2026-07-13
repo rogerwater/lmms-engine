@@ -4,7 +4,6 @@ import random
 import shutil
 import time
 from functools import partial
-from numbers import Number
 from typing import Optional, Union
 
 import numpy as np
@@ -22,7 +21,7 @@ from transformers.trainer_utils import seed_worker
 
 import lmms_engine.models.utils as model_utils
 import lmms_engine.parallel.process_group_manager as pgm
-from lmms_engine.accelerator import empty_cache, get_accelerator_type, get_device_name, synchronize
+from lmms_engine.accelerator import empty_cache, get_accelerator_type, get_current_device, get_device_name
 from lmms_engine.eval.backends import EvalServerBackend
 from lmms_engine.parallel.parallelize import MODEL_TO_PARALLEL_METHOD, apply_parallelize
 from lmms_engine.train.config import TrainingArguments
@@ -94,7 +93,6 @@ class FSDP2SFTTrainer:
             rank=dist.get_rank(),
         )
         self.accumulated_grad_steps = 0
-        self._reset_logging_window()
 
         # Optional EMA (fully opt-in)
         self.ema = EMAHelper(self.args)
@@ -275,17 +273,6 @@ class FSDP2SFTTrainer:
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return loss
 
-    def _reset_logging_window(self) -> None:
-        self._logging_metric_sums = {}
-        self._logging_metric_counts = {}
-        self._logging_metric_latest = {}
-        self._logging_metric_passthrough = {}
-        self._logging_seq_lens = []
-        self._logging_batch_token_counts = []
-        self._logging_raw_flops = 0.0
-        self._logging_promised_flops = 0.0
-        self._logging_window_start = time.perf_counter()
-
     @staticmethod
     def _get_batch_sequence_lengths(batch) -> list[int]:
         attention_mask = batch.get("attention_mask")
@@ -294,59 +281,6 @@ class FSDP2SFTTrainer:
         if attention_mask.device.type != "cpu":
             raise RuntimeError("Sequence lengths must be collected before the batch is moved to the accelerator.")
         return attention_mask.sum(dim=1).tolist()
-
-    def _accumulate_logging_metrics(self, metrics: dict) -> None:
-        latest_metric_names = {"train/lr", "train/discriminator_lr", "train/epoch"}
-        device = self.fsdp2_model.device
-
-        for name, value in metrics.items():
-            if torch.is_tensor(value):
-                scalar = value.detach().float()
-                if scalar.numel() != 1:
-                    scalar = scalar.mean()
-                scalar = scalar.to(device=device, non_blocking=True)
-            elif isinstance(value, Number):
-                scalar = float(value)
-            else:
-                self._logging_metric_passthrough[name] = value
-                continue
-
-            if name in latest_metric_names:
-                self._logging_metric_latest[name] = scalar
-                continue
-
-            if name not in self._logging_metric_sums:
-                self._logging_metric_sums[name] = scalar.clone() if torch.is_tensor(scalar) else scalar
-                self._logging_metric_counts[name] = 1
-            else:
-                if torch.is_tensor(self._logging_metric_sums[name]):
-                    self._logging_metric_sums[name].add_(scalar)
-                else:
-                    self._logging_metric_sums[name] += scalar
-                self._logging_metric_counts[name] += 1
-
-    def _reduce_logging_metrics(self) -> dict:
-        local_metrics = {
-            name: value / self._logging_metric_counts[name] for name, value in self._logging_metric_sums.items()
-        }
-        local_metrics.update(self._logging_metric_latest)
-        if not local_metrics:
-            return dict(self._logging_metric_passthrough)
-
-        metric_names = sorted(local_metrics)
-        packed_metrics = torch.stack(
-            [
-                value
-                if torch.is_tensor(value)
-                else torch.tensor(value, device=self.fsdp2_model.device, dtype=torch.float32)
-                for value in (local_metrics[name] for name in metric_names)
-            ]
-        )
-        if dist.get_world_size() > 1:
-            dist.all_reduce(packed_metrics, op=dist.ReduceOp.AVG)
-        reduced_metrics = dict(zip(metric_names, packed_metrics.tolist()))
-        reduced_metrics.update(self._logging_metric_passthrough)
-        return reduced_metrics
 
     def _set_fsdp2_gradient_sync(self, should_sync: bool) -> None:
         """Control FSDP2 gradient communication for gradient accumulation."""
@@ -371,8 +305,8 @@ class FSDP2SFTTrainer:
         loss = self.compute_loss(batch)
         if dist.get_world_size() > 1:
             loss = loss.mean()
-        loss_for_logging = loss.detach()
         loss = loss / self.args.gradient_accumulation_steps
+        loss_item = loss.item() * self.args.gradient_accumulation_steps
         loss.backward()
         self.accumulated_grad_steps += 1
         grad_norm = None
@@ -389,10 +323,17 @@ class FSDP2SFTTrainer:
             self.scheduler.step()
             self.accumulated_grad_steps = 0
 
-        metrics = {"train/loss": loss_for_logging}
+        lr = self.scheduler.get_last_lr()[0]
+        loss_item = torch.tensor(loss_item, device=get_current_device(), dtype=torch.float32)
+        if dist.get_world_size() > 1:
+            dist.all_reduce(loss_item, op=dist.ReduceOp.SUM)
+            loss_item.div_(dist.get_world_size())
+        metrics = {
+            "train/loss": loss_item.item(),
+            "train/lr": lr,
+        }
         if grad_norm is not None:
-            metrics["train/grad_norm"] = grad_norm.detach()
-            metrics["train/lr"] = self.scheduler.get_last_lr()[0]
+            metrics["train/grad_norm"] = grad_norm.item()
 
         return metrics
 
@@ -481,8 +422,6 @@ class FSDP2SFTTrainer:
         logger.info(f"Training with {self.args.num_train_epochs} epochs with {self.total_steps} steps")
         self.step_profiler.start()
         self.memory_snapshot_profiler.start()
-        self._reset_logging_window()
-        logging_steps = max(1, int(self.args.logging_steps))
 
         curr_epoch = start_epoch
 
@@ -506,6 +445,7 @@ class FSDP2SFTTrainer:
                 with self.cuda_event_profiler.record("host_to_device", self.global_step):
                     batch = send_to_device(batch, self.fsdp2_model.device, non_blocking=True)
                 self.memory_snapshot_profiler.step(self.global_step)
+                start_time = time.perf_counter()
                 try:
                     with self.cuda_event_profiler.record("training_step", self.global_step):
                         train_metrics = self.training_step(batch)
@@ -516,19 +456,31 @@ class FSDP2SFTTrainer:
                     if "out of memory" in str(e).lower():
                         self.memory_snapshot_profiler.dump_on_exception(f"oom_step{self.global_step}")
                     raise
+                end_time = time.perf_counter()
+                delta_time = max(end_time - start_time, 1e-12)
                 self.step_profiler.step()
                 if self.step_profiler.should_save(self.global_step + 1):
                     self.step_profiler.stop_and_save()
                     self.step_profiler.stop_trace()
 
                 with self.cuda_event_profiler.record("training_metrics", self.global_step):
-                    _, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(seq_len, delta_time=1.0)
+                    flops, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(
+                        seq_len, delta_time=delta_time
+                    )
                     self.compute_tracker.accumulate_flops(raw_flops)
-                    self._logging_seq_lens.extend(seq_len)
-                    self._logging_batch_token_counts.append(sum(seq_len))
-                    self._logging_raw_flops += raw_flops
-                    self._logging_promised_flops = promised_flops
-                    self._accumulate_logging_metrics(train_metrics)
+                    perf_metrics, self.total_tokens = self.calculate_training_metrics(
+                        flops=flops,
+                        parallel_size=(
+                            pgm.process_group_manager.cp_world_size * pgm.process_group_manager.tp_world_size
+                        ),
+                        promised_flops=promised_flops,
+                        device=self.fsdp2_model.device,
+                        seq_len=seq_len,
+                        total_tokens=self.total_tokens,
+                        delta_time=delta_time,
+                        world_size=world_size,
+                    )
+                    train_metrics.update(perf_metrics)
                 self.cuda_event_profiler.maybe_flush(self.global_step)
                 self.print_batch_input(batch)
 
@@ -536,32 +488,12 @@ class FSDP2SFTTrainer:
                 if is_accumulation_complete:
                     self.global_step += 1
                     if self.steps_per_epoch is not None and self.steps_per_epoch > 0:
-                        self._accumulate_logging_metrics({"train/epoch": self.global_step / self.steps_per_epoch})
+                        train_metrics["train/epoch"] = self.global_step / self.steps_per_epoch
+
+                    if rank == 0:
+                        self.tracking.log(train_metrics, step=self.global_step)
 
                     should_save = self.should_save
-                    should_log = self.global_step % logging_steps == 0 or should_save or self.should_stop()
-                    if should_log:
-                        synchronize()
-                        window_elapsed_time = max(time.perf_counter() - self._logging_window_start, 1e-12)
-                        flops = self._logging_raw_flops / window_elapsed_time / 1e12
-                        train_metrics = self._reduce_logging_metrics()
-                        perf_metrics, self.total_tokens = self.calculate_training_metrics(
-                            flops=flops,
-                            parallel_size=(
-                                pgm.process_group_manager.cp_world_size * pgm.process_group_manager.tp_world_size
-                            ),
-                            promised_flops=self._logging_promised_flops,
-                            device=self.fsdp2_model.device,
-                            seq_len=self._logging_seq_lens,
-                            batch_token_counts=self._logging_batch_token_counts,
-                            total_tokens=self.total_tokens,
-                            delta_time=window_elapsed_time,
-                            world_size=world_size,
-                        )
-                        train_metrics.update(perf_metrics)
-                        if rank == 0:
-                            self.tracking.log(train_metrics, step=self.global_step)
-
                     if should_save:
                         output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
                         self.save_checkpoints(
@@ -578,8 +510,6 @@ class FSDP2SFTTrainer:
                     ):
                         self.empty_cache()
                     pbar.update(1)
-                    if should_log:
-                        self._reset_logging_window()
                 self._check_eval_results(rank)
             curr_epoch += 1
 
@@ -797,7 +727,7 @@ class FSDP2SFTTrainer:
         """
         Calculate training performance metrics including MFU, token statistics, and throughput.
 
-        Uses one packed ``all_gather`` per logging window and reduces the
+        Uses one packed ``all_gather`` per training step and reduces the
         gathered values locally.
 
         Args:
@@ -807,9 +737,9 @@ class FSDP2SFTTrainer:
             device: Device to perform computations on.
             seq_len: List of sequence lengths per batch (one entry per local sample).
             total_tokens: Current total token count.
-            delta_time: Elapsed time for the logging window.
+            delta_time: Elapsed time for the current training step.
             world_size: Distributed training world size.
-            batch_token_counts: Local token count for every micro-batch in the logging window.
+            batch_token_counts: Optional local token counts represented by this metric sample.
 
         Returns:
             tuple: (metrics_dict, updated_total_tokens)
