@@ -100,8 +100,8 @@ class FSDP2SFTTrainer:
         self.ema = EMAHelper(self.args)
 
         # send_to_device uses non_blocking=True to overlap H2D with the next
-        # training step. This requires pinned memory; pageable memory falls
-        # back to a synchronous copy and the flag becomes a no-op.
+        # training step. prepare_dataloader explicitly selects the NPU pinning
+        # backend because StatefulDataLoader otherwise defaults to CUDA.
         if not self.args.dataloader_pin_memory:
             logger.warning(
                 "send_to_device uses non_blocking=True but dataloader_pin_memory "
@@ -137,13 +137,20 @@ class FSDP2SFTTrainer:
     def prepare_dataloader(self, dataset: DatasetType, is_training: bool = True):
         data_collator = self.data_collator
         num_workers = self.args.dataloader_num_workers
+        pin_memory = bool(self.args.dataloader_pin_memory)
+        accelerator_type = get_accelerator_type()
         dataloader_params = {
             "batch_size": self.args.train_batch_size,
             "collate_fn": data_collator,
             "num_workers": num_workers,
-            "pin_memory": self.args.dataloader_pin_memory,
+            "pin_memory": pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers if num_workers > 0 else False,
         }
+        if pin_memory and accelerator_type == "npu":
+            # torchdata 0.11 defaults an empty pin_memory_device to CUDA in its
+            # multiprocessing iterator. Selecting the registered PrivateUse1
+            # backend keeps the pinning thread and allocations on NPU.
+            dataloader_params["pin_memory_device"] = "npu"
         if isinstance(dataset, IterableDataset):
             sampler = None
         elif self.args.group_by_length:
