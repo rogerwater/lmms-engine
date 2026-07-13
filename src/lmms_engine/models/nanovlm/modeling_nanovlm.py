@@ -132,17 +132,22 @@ class NanovlmForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 pixel_attention_mask=pixel_attention_mask,
                 spatial_shapes=spatial_shapes,
             )
-            n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
-            n_image_features = image_embeds.shape[0]
-            if n_image_tokens != n_image_features:
-                raise ValueError(
-                    f"Image features and image tokens do not match: tokens {n_image_tokens}, features {n_image_features}"
-                )
-
             mask = input_ids == self.config.image_token_id
+            if self.config.validate_image_token_count:
+                n_image_tokens = mask.sum().item()
+                n_image_features = image_embeds.shape[0]
+                if n_image_tokens != n_image_features:
+                    raise ValueError(
+                        "Image features and image tokens do not match: "
+                        f"tokens {n_image_tokens}, features {n_image_features}"
+                    )
+
             image_mask = mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if self.training:
+            kwargs["use_cache"] = False
 
         return self.language_model(
             input_ids=None,

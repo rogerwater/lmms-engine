@@ -4,6 +4,7 @@ import random
 import shutil
 import time
 from functools import partial
+from numbers import Number
 from typing import Optional, Union
 
 import numpy as np
@@ -21,7 +22,7 @@ from transformers.trainer_utils import seed_worker
 
 import lmms_engine.models.utils as model_utils
 import lmms_engine.parallel.process_group_manager as pgm
-from lmms_engine.accelerator import empty_cache, get_accelerator_type, get_current_device, get_device_name
+from lmms_engine.accelerator import empty_cache, get_accelerator_type, get_device_name, synchronize
 from lmms_engine.eval.backends import EvalServerBackend
 from lmms_engine.parallel.parallelize import MODEL_TO_PARALLEL_METHOD, apply_parallelize
 from lmms_engine.train.config import TrainingArguments
@@ -93,6 +94,7 @@ class FSDP2SFTTrainer:
             rank=dist.get_rank(),
         )
         self.accumulated_grad_steps = 0
+        self._reset_logging_window()
 
         # Optional EMA (fully opt-in)
         self.ema = EMAHelper(self.args)
@@ -134,12 +136,13 @@ class FSDP2SFTTrainer:
 
     def prepare_dataloader(self, dataset: DatasetType, is_training: bool = True):
         data_collator = self.data_collator
+        num_workers = self.args.dataloader_num_workers
         dataloader_params = {
             "batch_size": self.args.train_batch_size,
             "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
+            "num_workers": num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
+            "persistent_workers": self.args.dataloader_persistent_workers if num_workers > 0 else False,
         }
         if isinstance(dataset, IterableDataset):
             sampler = None
@@ -160,11 +163,12 @@ class FSDP2SFTTrainer:
             )
         dataloader_params["sampler"] = sampler
         dataloader_params["drop_last"] = self.args.dataloader_drop_last
-        dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+        if num_workers > 0 and self.args.dataloader_prefetch_factor is not None:
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
         if is_training:
             dataloader_params["worker_init_fn"] = partial(
                 seed_worker,
-                num_workers=self.args.dataloader_num_workers,
+                num_workers=num_workers,
                 rank=pgm.process_group_manager.dp_rank,
             )
         dataloader = StatefulDataLoader(dataset, **dataloader_params)
@@ -264,18 +268,106 @@ class FSDP2SFTTrainer:
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return loss
 
+    def _reset_logging_window(self) -> None:
+        self._logging_metric_sums = {}
+        self._logging_metric_counts = {}
+        self._logging_metric_latest = {}
+        self._logging_metric_passthrough = {}
+        self._logging_seq_lens = []
+        self._logging_batch_token_counts = []
+        self._logging_raw_flops = 0.0
+        self._logging_promised_flops = 0.0
+        self._logging_window_start = time.perf_counter()
+
+    @staticmethod
+    def _get_batch_sequence_lengths(batch) -> list[int]:
+        attention_mask = batch.get("attention_mask")
+        if not torch.is_tensor(attention_mask):
+            return [0]
+        if attention_mask.device.type != "cpu":
+            raise RuntimeError("Sequence lengths must be collected before the batch is moved to the accelerator.")
+        return attention_mask.sum(dim=1).tolist()
+
+    def _accumulate_logging_metrics(self, metrics: dict) -> None:
+        latest_metric_names = {"train/lr", "train/discriminator_lr", "train/epoch"}
+        device = self.fsdp2_model.device
+
+        for name, value in metrics.items():
+            if torch.is_tensor(value):
+                scalar = value.detach().float()
+                if scalar.numel() != 1:
+                    scalar = scalar.mean()
+                scalar = scalar.to(device=device, non_blocking=True)
+            elif isinstance(value, Number):
+                scalar = float(value)
+            else:
+                self._logging_metric_passthrough[name] = value
+                continue
+
+            if name in latest_metric_names:
+                self._logging_metric_latest[name] = scalar
+                continue
+
+            if name not in self._logging_metric_sums:
+                self._logging_metric_sums[name] = scalar.clone() if torch.is_tensor(scalar) else scalar
+                self._logging_metric_counts[name] = 1
+            else:
+                if torch.is_tensor(self._logging_metric_sums[name]):
+                    self._logging_metric_sums[name].add_(scalar)
+                else:
+                    self._logging_metric_sums[name] += scalar
+                self._logging_metric_counts[name] += 1
+
+    def _reduce_logging_metrics(self) -> dict:
+        local_metrics = {
+            name: value / self._logging_metric_counts[name] for name, value in self._logging_metric_sums.items()
+        }
+        local_metrics.update(self._logging_metric_latest)
+        if not local_metrics:
+            return dict(self._logging_metric_passthrough)
+
+        metric_names = sorted(local_metrics)
+        packed_metrics = torch.stack(
+            [
+                value
+                if torch.is_tensor(value)
+                else torch.tensor(value, device=self.fsdp2_model.device, dtype=torch.float32)
+                for value in (local_metrics[name] for name in metric_names)
+            ]
+        )
+        if dist.get_world_size() > 1:
+            dist.all_reduce(packed_metrics, op=dist.ReduceOp.AVG)
+        reduced_metrics = dict(zip(metric_names, packed_metrics.tolist()))
+        reduced_metrics.update(self._logging_metric_passthrough)
+        return reduced_metrics
+
+    def _set_fsdp2_gradient_sync(self, should_sync: bool) -> None:
+        """Control FSDP2 gradient communication for gradient accumulation."""
+        if self.args.gradient_accumulation_steps <= 1 or dist.get_world_size() <= 1:
+            return
+
+        set_requires_gradient_sync = getattr(self.fsdp2_model, "set_requires_gradient_sync", None)
+        if not callable(set_requires_gradient_sync):
+            raise RuntimeError(
+                "FSDP2 gradient accumulation requires "
+                "FSDPModule.set_requires_gradient_sync(), but the prepared model does not expose it."
+            )
+        set_requires_gradient_sync(should_sync, recurse=True)
+
     def training_step(self, batch):
         self.fsdp2_model.train()
         if self.accumulated_grad_steps == 0:
             self.optimizer.zero_grad()
+
+        should_update = self.accumulated_grad_steps + 1 >= self.args.gradient_accumulation_steps
+        self._set_fsdp2_gradient_sync(should_sync=should_update)
         loss = self.compute_loss(batch)
         if dist.get_world_size() > 1:
             loss = loss.mean()
+        loss_for_logging = loss.detach()
         loss = loss / self.args.gradient_accumulation_steps
-        loss_item = loss.item() * self.args.gradient_accumulation_steps
         loss.backward()
         self.accumulated_grad_steps += 1
-        should_update = self.accumulated_grad_steps >= self.args.gradient_accumulation_steps
         grad_norm = None
         if should_update:
             grad_norm = fsdp2_clip_grad_norm_(self.fsdp2_model.parameters(), self.args.max_grad_norm)
@@ -290,16 +382,10 @@ class FSDP2SFTTrainer:
             self.scheduler.step()
             self.accumulated_grad_steps = 0
 
-        # reduce loss across dp ranks
-        lr = self.scheduler.get_last_lr()[0]
-        loss_item = torch.tensor(loss_item, device=get_current_device())
-        torch.distributed.all_reduce(loss_item, op=torch.distributed.ReduceOp.AVG)
-        metrics = {
-            "train/loss": loss_item.item(),
-            "train/lr": lr,
-        }
+        metrics = {"train/loss": loss_for_logging}
         if grad_norm is not None:
-            metrics["train/grad_norm"] = grad_norm.item()
+            metrics["train/grad_norm"] = grad_norm.detach()
+            metrics["train/lr"] = self.scheduler.get_last_lr()[0]
 
         return metrics
 
@@ -383,10 +469,13 @@ class FSDP2SFTTrainer:
 
         # Initialize EMA after model weights are loaded (and optionally restore from checkpoint).
         self.ema.maybe_init(model=self.fsdp2_model, checkpoint_dir=loaded_checkpoint_dir)
+        last_saved_step = self.global_step if loaded_checkpoint_dir is not None else None
 
         logger.info(f"Training with {self.args.num_train_epochs} epochs with {self.total_steps} steps")
         self.step_profiler.start()
         self.memory_snapshot_profiler.start()
+        self._reset_logging_window()
+        logging_steps = max(1, int(self.args.logging_steps))
 
         curr_epoch = start_epoch
 
@@ -405,11 +494,11 @@ class FSDP2SFTTrainer:
             for step, batch in enumerate(self.train_dataloader):
                 if self.should_stop():
                     break
+                seq_len = self._get_batch_sequence_lengths(batch)
                 # send batch to device
                 with self.cuda_event_profiler.record("host_to_device", self.global_step):
                     batch = send_to_device(batch, self.fsdp2_model.device, non_blocking=True)
                 self.memory_snapshot_profiler.step(self.global_step)
-                start_time = time.perf_counter()
                 try:
                     with self.cuda_event_profiler.record("training_step", self.global_step):
                         train_metrics = self.training_step(batch)
@@ -424,46 +513,49 @@ class FSDP2SFTTrainer:
                 if self.step_profiler.should_save(self.global_step + 1):
                     self.step_profiler.stop_and_save()
                     self.step_profiler.stop_trace()
-                end_time = time.perf_counter()
-                delta_time = end_time - start_time
 
                 with self.cuda_event_profiler.record("training_metrics", self.global_step):
-                    # Calculate flops per rank
-                    seq_len = batch.get("attention_mask", torch.zeros((1, 1))).sum(dim=1).detach().cpu().tolist()
-                    flops, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(
-                        seq_len, delta_time=delta_time
-                    )
+                    _, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(seq_len, delta_time=1.0)
                     self.compute_tracker.accumulate_flops(raw_flops)
-                    device = self.fsdp2_model.device
-                    sp_size = pgm.process_group_manager.cp_world_size
-                    tp_size = pgm.process_group_manager.tp_world_size
-                    parallel_size = sp_size * tp_size
-
-                    # Calculate training metrics (MFU, token stats, throughput)
-                    perf_metrics, self.total_tokens = self.calculate_training_metrics(
-                        flops=flops,
-                        parallel_size=parallel_size,
-                        promised_flops=promised_flops,
-                        device=device,
-                        seq_len=seq_len,
-                        total_tokens=self.total_tokens,
-                        delta_time=delta_time,
-                        world_size=world_size,
-                    )
+                    self._logging_seq_lens.extend(seq_len)
+                    self._logging_batch_token_counts.append(sum(seq_len))
+                    self._logging_raw_flops += raw_flops
+                    self._logging_promised_flops = promised_flops
+                    self._accumulate_logging_metrics(train_metrics)
                 self.cuda_event_profiler.maybe_flush(self.global_step)
-                train_metrics.update(perf_metrics)
                 self.print_batch_input(batch)
 
                 is_accumulation_complete = self.accumulated_grad_steps == 0
-
-                if self.steps_per_epoch is not None and self.steps_per_epoch > 0:
-                    epoch_progress = f"{self.global_step / self.steps_per_epoch:.2f}"
-                    train_metrics["train/epoch"] = float(epoch_progress)
                 if is_accumulation_complete:
-                    if rank == 0:
-                        self.tracking.log(train_metrics, step=self.global_step)
                     self.global_step += 1
-                    if self.should_save:
+                    if self.steps_per_epoch is not None and self.steps_per_epoch > 0:
+                        self._accumulate_logging_metrics({"train/epoch": self.global_step / self.steps_per_epoch})
+
+                    should_save = self.should_save
+                    should_log = self.global_step % logging_steps == 0 or should_save or self.should_stop()
+                    if should_log:
+                        synchronize()
+                        window_elapsed_time = max(time.perf_counter() - self._logging_window_start, 1e-12)
+                        flops = self._logging_raw_flops / window_elapsed_time / 1e12
+                        train_metrics = self._reduce_logging_metrics()
+                        perf_metrics, self.total_tokens = self.calculate_training_metrics(
+                            flops=flops,
+                            parallel_size=(
+                                pgm.process_group_manager.cp_world_size * pgm.process_group_manager.tp_world_size
+                            ),
+                            promised_flops=self._logging_promised_flops,
+                            device=self.fsdp2_model.device,
+                            seq_len=self._logging_seq_lens,
+                            batch_token_counts=self._logging_batch_token_counts,
+                            total_tokens=self.total_tokens,
+                            delta_time=window_elapsed_time,
+                            world_size=world_size,
+                        )
+                        train_metrics.update(perf_metrics)
+                        if rank == 0:
+                            self.tracking.log(train_metrics, step=self.global_step)
+
+                    if should_save:
                         output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
                         self.save_checkpoints(
                             output_dir,
@@ -471,6 +563,7 @@ class FSDP2SFTTrainer:
                             total_limit=self.args.save_total_limit,
                         )
                         self.validation_step(output_dir, self.global_step)
+                        last_saved_step = self.global_step
 
                     if (
                         self.args.torch_empty_cache_steps is not None
@@ -478,15 +571,19 @@ class FSDP2SFTTrainer:
                     ):
                         self.empty_cache()
                     pbar.update(1)
+                    if should_log:
+                        self._reset_logging_window()
                 self._check_eval_results(rank)
             curr_epoch += 1
 
         pbar.close()
         self.memory_snapshot_profiler.stop_and_save(reason="train_end")
-        # Save the final checkpoint
-        output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
-        self.save_checkpoints(output_dir, self.global_step, total_limit=self.args.save_total_limit)
-        self.validation_step(output_dir, self.global_step)
+        if last_saved_step != self.global_step:
+            output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")
+            self.save_checkpoints(output_dir, self.global_step, total_limit=self.args.save_total_limit)
+            self.validation_step(output_dir, self.global_step)
+        elif rank == 0:
+            logger.info(f"Final checkpoint for step {self.global_step} already exists; skipping duplicate save.")
         # Wait for all pending eval jobs to complete
         if self.eval_backend is not None:
             self._check_eval_results(rank, wait_until_complete=True)
@@ -688,13 +785,13 @@ class FSDP2SFTTrainer:
         total_tokens: int,
         delta_time: float,
         world_size: int,
+        batch_token_counts: Optional[list] = None,
     ) -> tuple[dict, int]:
         """
         Calculate training performance metrics including MFU, token statistics, and throughput.
 
-        Uses a single ``all_gather`` over a 2-element per-rank tensor
-        ``[mfu_local, seq_len_sum_local]`` and reduces (mean/sum/min/max)
-        locally, replacing five independent ``all_reduce`` calls.
+        Uses one packed ``all_gather`` per logging window and reduces the
+        gathered values locally.
 
         Args:
             flops: Per-rank FLOPs count (Python float from ``estimate_flops``).
@@ -703,8 +800,9 @@ class FSDP2SFTTrainer:
             device: Device to perform computations on.
             seq_len: List of sequence lengths per batch (one entry per local sample).
             total_tokens: Current total token count.
-            delta_time: Time taken for the training step.
+            delta_time: Elapsed time for the logging window.
             world_size: Distributed training world size.
+            batch_token_counts: Local token count for every micro-batch in the logging window.
 
         Returns:
             tuple: (metrics_dict, updated_total_tokens)
@@ -712,32 +810,61 @@ class FSDP2SFTTrainer:
         # Divide mfu by parallel size because seq_len/flops are estimated
         # before SP/TP sharding. seq_len comes in as a plain Python list so we
         # avoid an extra GPU sync and just sum it on the host.
-        mfu_local = flops / parallel_size / promised_flops
+        mfu_local = flops / parallel_size / promised_flops if promised_flops > 0 else 0.0
         seq_len_sum_local = float(sum(seq_len))
+        batch_token_counts = batch_token_counts or [seq_len_sum_local]
+        batch_token_avg_local = float(sum(batch_token_counts)) / len(batch_token_counts)
+        batch_token_min_local = float(min(batch_token_counts))
+        batch_token_max_local = float(max(batch_token_counts))
 
-        local = torch.tensor([mfu_local, seq_len_sum_local], device=device, dtype=torch.float32)
-        gathered = torch.empty(world_size * 2, device=device, dtype=torch.float32)
-        torch.distributed.all_gather_into_tensor(gathered, local)
-        gathered = gathered.view(world_size, 2)
+        local = torch.tensor(
+            [
+                mfu_local,
+                seq_len_sum_local,
+                batch_token_avg_local,
+                batch_token_min_local,
+                batch_token_max_local,
+                delta_time,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        if world_size > 1:
+            gathered = torch.empty(world_size * local.numel(), device=device, dtype=torch.float32)
+            torch.distributed.all_gather_into_tensor(gathered, local)
+            gathered = gathered.view(world_size, local.numel())
+        else:
+            gathered = local.unsqueeze(0)
 
         mfu_all = gathered[:, 0]
         sl_all = gathered[:, 1]
+        batch_avg_all = gathered[:, 2]
+        batch_min_all = gathered[:, 3]
+        batch_max_all = gathered[:, 4]
+        elapsed_all = gathered[:, 5]
 
-        # Reduce on-device, then do a single batched .tolist() sync to pull
-        # all five scalars at once.
+        # Reduce on-device, then do a single batched .tolist() sync.
         reduced = torch.stack(
             [
                 mfu_all.mean(),
                 sl_all.sum() / parallel_size,  # total_seq_len (deduped across SP/TP)
-                sl_all.mean(),  # global_seq_len_avg
-                sl_all.amin(),  # global_seq_len_min
-                sl_all.amax(),  # global_seq_len_max
+                batch_avg_all.mean(),
+                batch_min_all.amin(),
+                batch_max_all.amax(),
+                elapsed_all.amax(),
             ]
         ).tolist()
-        mfu, total_seq_len, global_seq_len_avg, global_seq_len_min, global_seq_len_max = reduced
+        (
+            mfu,
+            total_seq_len,
+            global_seq_len_avg,
+            global_seq_len_min,
+            global_seq_len_max,
+            global_elapsed_time,
+        ) = reduced
 
         total_tokens += total_seq_len
-        tokens_per_second = total_seq_len / delta_time
+        tokens_per_second = total_seq_len / global_elapsed_time
         tokens_per_gpu = tokens_per_second / world_size
 
         metrics = {

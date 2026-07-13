@@ -37,6 +37,13 @@ def empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def synchronize() -> None:
+    if is_npu_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def get_device_name() -> str:
     if is_npu_available():
         return torch.npu.get_device_name()
