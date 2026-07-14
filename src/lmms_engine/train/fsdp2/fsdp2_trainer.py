@@ -459,9 +459,8 @@ class FSDP2SFTTrainer:
                 end_time = time.perf_counter()
                 delta_time = max(end_time - start_time, 1e-12)
                 self.step_profiler.step()
-                if self.step_profiler.should_save(self.global_step + 1):
+                if self.step_profiler.should_save():
                     self.step_profiler.stop_and_save()
-                    self.step_profiler.stop_trace()
 
                 with self.cuda_event_profiler.record("training_metrics", self.global_step):
                     flops, promised_flops, raw_flops = model_utils.flops_counter.estimate_flops(
@@ -514,6 +513,9 @@ class FSDP2SFTTrainer:
             curr_epoch += 1
 
         pbar.close()
+        # Flush a partial trace when training ends before the configured
+        # profiler window. This is also a no-op after a scheduled save.
+        self.step_profiler.stop_and_save()
         self.memory_snapshot_profiler.stop_and_save(reason="train_end")
         if last_saved_step != self.global_step:
             output_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}")

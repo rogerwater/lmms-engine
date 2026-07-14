@@ -186,7 +186,13 @@ trainer_args:
   output_dtype: bfloat16
   print_batch_input_steps: -1
   enable_profiler: false
-  profiler_config: null
+  # StepProfiler counts micro-steps. On NPU, only rank 0 is profiled by
+  # default and the parsed trace is written under output_dir/profiler.
+  profiler_config:
+    start_step: 0
+    warmup_steps: 1
+    end_step: 5
+    ranks: null
   enable_cuda_event_profiler: false
   cuda_event_profiler_config: null
   ep_degree: 1
