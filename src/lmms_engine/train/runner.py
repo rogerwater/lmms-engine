@@ -124,6 +124,9 @@ class TrainRunner:
         try:
             MONKEY_PATCHER.apply_monkey_patch_to_instance(self.model, **kwargs)
         except Exception as e:
+            if kwargs.get("strict", False):
+                logger.exception(f"Error applying strict monkey patch: {e}")
+                raise
             logger.error(f"Error applying monkey patch: {e}. Skip monkey patch.")
 
     def _build_train_dataset(self):

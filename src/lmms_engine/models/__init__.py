@@ -8,7 +8,12 @@ from .config import ModelConfig
 from .llava_onevision import apply_liger_kernel_to_llava_onevision
 from .llava_onevision2 import apply_liger_kernel_to_llava_onevision2
 from .monkey_patch import MONKEY_PATCHER
-from .nanovlm import NanovlmConfig, NanovlmForConditionalGeneration, apply_liger_rmsnorm_to_nanovlm
+from .nanovlm import (
+    NanovlmConfig,
+    NanovlmForConditionalGeneration,
+    apply_liger_rmsnorm_to_nanovlm,
+    apply_torch_npu_rmsnorm_to_nanovlm,
+)
 from .qwen2 import apply_liger_kernel_to_qwen2
 from .qwen2_5_omni import (
     Qwen2_5OmniThinkerConfig,
@@ -67,6 +72,7 @@ __all__ = [
     "NanovlmConfig",
     "NanovlmForConditionalGeneration",
     "apply_liger_rmsnorm_to_nanovlm",
+    "apply_torch_npu_rmsnorm_to_nanovlm",
     "RaeSiglipConfig",
     "RaeSiglipModel",
     "SiTModel",

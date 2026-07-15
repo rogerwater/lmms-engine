@@ -29,6 +29,17 @@ PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-16}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
 USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-false}"
+USE_NPU_RMS_NORM="${USE_NPU_RMS_NORM:-true}"
+
+if [[ "${USE_LIGER_KERNEL}" == "true" && "${USE_NPU_RMS_NORM}" == "true" ]]; then
+  echo "USE_LIGER_KERNEL and USE_NPU_RMS_NORM are mutually exclusive." >&2
+  exit 2
+fi
+
+MODEL_PATCH_ARGS=()
+if [[ "${USE_NPU_RMS_NORM}" == "true" ]]; then
+  MODEL_PATCH_ARGS+=("model_config.monkey_patch_kwargs={patch_type: [npu_rms_norm], strict: true}")
+fi
 
 LEARNING_RATE="${LEARNING_RATE:-1.0e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
@@ -111,4 +122,5 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" \
   trainer_args.profiler_config.end_step="${PROFILER_END_STEP}" \
   trainer_args.profiler_config.ranks="${PROFILER_RANKS}" \
   trainer_args.report_to='[]' \
-  trainer_args.group_by_length=false
+  trainer_args.group_by_length=false \
+  "${MODEL_PATCH_ARGS[@]}"
