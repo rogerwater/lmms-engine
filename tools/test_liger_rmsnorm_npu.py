@@ -53,6 +53,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--rtol", type=float, default=5e-2)
     parser.add_argument("--atol", type=float, default=5e-3)
+    parser.add_argument(
+        "--in-place",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse the upstream-gradient storage for the RMSNorm input "
+            "gradient during backward (default: disabled)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -78,11 +87,12 @@ def main() -> None:
     print(f"  device:         {device}")
     print(f"  dtype:          {dtype}")
     print(f"  input shape:    {shape}")
+    print(f"  in_place:       {args.in_place}")
 
     liger_norm = LigerRMSNorm(
         hidden_size=args.hidden_size,
         eps=args.eps,
-        in_place=False,
+        in_place=args.in_place,
     ).to(device=device, dtype=dtype)
 
     with torch.no_grad():
@@ -101,8 +111,16 @@ def main() -> None:
     )
 
     grad_output = torch.randn_like(liger_output)
-    liger_output.backward(grad_output)
-    reference_output.backward(grad_output)
+
+    # Liger RMSNorm with in_place=True may reuse dY's storage for dX during
+    # backward. Give each implementation its own upstream-gradient tensor so
+    # that the Liger backward cannot change the gradient subsequently consumed
+    # by the PyTorch reference backward.
+    liger_grad_output = grad_output.detach().clone()
+    reference_grad_output = grad_output.detach().clone()
+
+    reference_output.backward(reference_grad_output)
+    liger_output.backward(liger_grad_output)
     torch.npu.synchronize()
 
     tensors = {
@@ -140,7 +158,10 @@ def main() -> None:
             msg=lambda msg, name=name: f"{name} mismatch:\n{msg}",
         )
 
-    print("\nPASS: Liger RMSNorm NPU forward/backward matches the PyTorch reference.")
+    print(
+        "\nPASS: Liger RMSNorm NPU forward/backward matches the PyTorch "
+        f"reference (in_place={args.in_place})."
+    )
 
 
 if __name__ == "__main__":
