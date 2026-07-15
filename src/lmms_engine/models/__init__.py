@@ -11,7 +11,7 @@ from .monkey_patch import MONKEY_PATCHER
 from .nanovlm import (
     NanovlmConfig,
     NanovlmForConditionalGeneration,
-    apply_liger_rmsnorm_to_nanovlm,
+    apply_torch_npu_rope_to_nanovlm,
     apply_torch_npu_rmsnorm_to_nanovlm,
 )
 from .qwen2 import apply_liger_kernel_to_qwen2
@@ -71,7 +71,7 @@ __all__ = [
     "MONKEY_PATCHER",
     "NanovlmConfig",
     "NanovlmForConditionalGeneration",
-    "apply_liger_rmsnorm_to_nanovlm",
+    "apply_torch_npu_rope_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
     "RaeSiglipConfig",
     "RaeSiglipModel",

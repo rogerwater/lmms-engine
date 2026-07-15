@@ -28,17 +28,23 @@ DDP_BACKEND="${DDP_BACKEND:-hccl}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-16}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
-USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-false}"
 USE_NPU_RMS_NORM="${USE_NPU_RMS_NORM:-true}"
+USE_NPU_ROPE="${USE_NPU_ROPE:-false}"
 
-if [[ "${USE_LIGER_KERNEL}" == "true" && "${USE_NPU_RMS_NORM}" == "true" ]]; then
-  echo "USE_LIGER_KERNEL and USE_NPU_RMS_NORM are mutually exclusive." >&2
-  exit 2
-fi
-
+MODEL_PATCH_TYPES=()
 MODEL_PATCH_ARGS=()
 if [[ "${USE_NPU_RMS_NORM}" == "true" ]]; then
-  MODEL_PATCH_ARGS+=("model_config.monkey_patch_kwargs={patch_type: [npu_rms_norm], strict: true}")
+  MODEL_PATCH_TYPES+=("npu_rms_norm")
+fi
+if [[ "${USE_NPU_ROPE}" == "true" ]]; then
+  MODEL_PATCH_TYPES+=("npu_rope")
+fi
+if (( ${#MODEL_PATCH_TYPES[@]} > 0 )); then
+  printf -v MODEL_PATCH_TYPE_LIST '%s,' "${MODEL_PATCH_TYPES[@]}"
+  MODEL_PATCH_TYPE_LIST="${MODEL_PATCH_TYPE_LIST%,}"
+  MODEL_PATCH_ARGS+=(
+    "model_config.monkey_patch_kwargs={patch_type: [${MODEL_PATCH_TYPE_LIST}], strict: true}"
+  )
 fi
 
 LEARNING_RATE="${LEARNING_RATE:-1.0e-3}"
@@ -106,7 +112,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" \
   trainer_args.fsdp_config.transformer_layer_cls_to_wrap='["Qwen3DecoderLayer"]' \
   trainer_args.fsdp_config.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
   trainer_args.sp_ulysses_degree=1 \
-  trainer_args.use_liger_kernel="${USE_LIGER_KERNEL}" \
   trainer_args.use_rmpad=false \
   trainer_args.dataloader_num_workers="${DATALOADER_NUM_WORKERS}" \
   trainer_args.dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR}" \

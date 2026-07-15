@@ -1,15 +1,7 @@
-"""NanoVLM-specific RMSNorm monkey patches.
-
-NanoVLM is registered as ``model_type=nanovlm`` while its text backbone is a
-Qwen3 causal language model. Generic Qwen3 registrations therefore do not
-match the top-level model. The patches in this module replace only RMSNorm
-forwards inside the already-constructed text model and leave attention, model
-parameters, and state-dict keys untouched.
-"""
+"""Independent torch_npu monkey patches for NanoVLM's Qwen3 backbone."""
 
 from __future__ import annotations
 
-import inspect
 from types import MethodType
 from typing import Any, Callable
 
@@ -17,35 +9,36 @@ from loguru import logger
 
 from lmms_engine.models.monkey_patch import MONKEY_PATCHER
 
-
-def _load_liger_rms_norm_patcher() -> Callable[..., None]:
-    try:
-        from liger_kernel.transformers.monkey_patch import _patch_rms_norm_module
-    except ImportError as exc:
-        raise ImportError(
-            "NanoVLM Liger RMSNorm was requested, but liger-kernel could not "
-            "be imported. Install a Liger/Triton version compatible with the "
-            "current accelerator environment."
-        ) from exc
-    return _patch_rms_norm_module
+from .npu_fused_ops import make_torch_npu_apply_rotary_pos_emb
 
 
-def _load_torch_npu_rms_norm_operator() -> Callable[..., Any]:
+def _load_torch_npu_operator(name: str) -> Callable[..., Any]:
     try:
         import torch_npu
     except ImportError as exc:
         raise ImportError(
-            "NanoVLM torch_npu RMSNorm was requested, but torch_npu could not "
-            "be imported. Install torch_npu for the current PyTorch and CANN "
-            "versions."
+            f"NanoVLM {name} was requested, but torch_npu could not be imported. "
+            "Install torch_npu for the current PyTorch and CANN versions."
         ) from exc
 
-    operator = getattr(torch_npu, "npu_rms_norm", None)
+    operator = getattr(torch_npu, name, None)
     if operator is None:
-        raise RuntimeError(
-            "The installed torch_npu does not expose torch_npu.npu_rms_norm."
-        )
+        raise RuntimeError(f"The installed torch_npu does not expose torch_npu.{name}.")
     return operator
+
+
+def _load_torch_npu_rms_norm_operator() -> Callable[..., Any]:
+    return _load_torch_npu_operator("npu_rms_norm")
+
+
+def _load_torch_npu_rotary_mul_operator() -> Callable[..., Any]:
+    return _load_torch_npu_operator("npu_rotary_mul")
+
+
+def _load_qwen3_modeling_module() -> Any:
+    from transformers.models.qwen3 import modeling_qwen3
+
+    return modeling_qwen3
 
 
 def _config_model_type(config: Any) -> Any:
@@ -54,10 +47,10 @@ def _config_model_type(config: Any) -> Any:
     return getattr(config, "model_type", None)
 
 
-def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any, str]:
+def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, str]:
     language_model = getattr(model, "language_model", None)
     if language_model is None:
-        raise ValueError("NanoVLM RMSNorm patch requires model.language_model.")
+        raise ValueError("NanoVLM NPU patches require model.language_model.")
 
     base_model_prefix = getattr(language_model, "base_model_prefix", "model")
     base_model = getattr(language_model, base_model_prefix, None)
@@ -69,16 +62,13 @@ def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any, str]:
             f"language_model (base_model_prefix={base_model_prefix!r})."
         )
 
-    # In a composite PreTrainedModel, Transformers may expose the top-level
-    # NanovlmConfig through language_model.config after construction. The
-    # nested text_config remains the authoritative backbone configuration.
+    # Transformers composite models can expose the outer NanovlmConfig through
+    # language_model.config. The nested text_config is authoritative here.
     top_level_config = getattr(model, "config", None)
     text_config = getattr(top_level_config, "text_config", None)
     model_types = {
         "model.config.text_config": _config_model_type(text_config),
-        "language_model.config": _config_model_type(
-            getattr(language_model, "config", None)
-        ),
+        "language_model.config": _config_model_type(getattr(language_model, "config", None)),
         "base_model.config": _config_model_type(getattr(base_model, "config", None)),
     }
     qwen3_class_names = {"Qwen3ForCausalLM", "Qwen3Model"}
@@ -91,9 +81,8 @@ def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any, str]:
     )
     if not is_qwen3:
         message = (
-            "NanoVLM RMSNorm patches currently support only a Qwen3 text "
-            f"backbone, but detected model_types={model_types!r}, "
-            f"class_names={class_names!r}."
+            "NanoVLM NPU patches currently support only a Qwen3 text backbone, "
+            f"but detected model_types={model_types!r}, class_names={class_names!r}."
         )
         if strict:
             raise ValueError(message)
@@ -102,7 +91,7 @@ def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any, str]:
     detected_model_type = "qwen3" if is_qwen3 else str(
         next((value for value in model_types.values() if value is not None), "unknown")
     )
-    return language_model, base_model, detected_model_type
+    return base_model, detected_model_type
 
 
 def _collect_qwen3_rms_norm_modules(base_model: Any, strict: bool) -> list[tuple[str, Any]]:
@@ -167,73 +156,12 @@ def _rms_norm_epsilon_attribute(module: Any) -> str:
     )
 
 
-def _ensure_backend_compatible(module: Any, requested_backend: str) -> None:
-    current_backend = getattr(module, "_lmms_engine_rms_norm_backend", None)
-    if current_backend is None:
-        if getattr(module, "_lmms_engine_liger_rms_norm", False):
-            current_backend = "liger"
-        elif getattr(module, "_lmms_engine_torch_npu_rms_norm", False):
-            current_backend = "torch_npu"
-
-    if current_backend is not None and current_backend != requested_backend:
-        raise RuntimeError(
-            "RMSNorm backend conflict: "
-            f"module is already patched with {current_backend!r}, but "
-            f"{requested_backend!r} was requested. Enable only one RMSNorm backend."
-        )
-
-
-def _patch_rms_norm_module(
-    module: Any,
-    patcher: Callable[..., None],
-    in_place: bool,
-    strict: bool,
-) -> bool:
-    if not hasattr(module, "weight"):
-        raise TypeError(f"Expected an RMSNorm-like module with a weight parameter, got {type(module)!r}.")
-
-    _ensure_backend_compatible(module, "liger")
-
-    state_dict_keys_before = tuple(module.state_dict().keys())
-    already_patched = bool(getattr(module, "_lmms_engine_liger_rms_norm", False))
-
-    patcher_signature = inspect.signature(patcher)
-    patcher_kwargs: dict[str, Any] = {}
-    if "offset" in patcher_signature.parameters:
-        patcher_kwargs["offset"] = 0.0
-    if "casting_mode" in patcher_signature.parameters:
-        patcher_kwargs["casting_mode"] = "llama"
-    if "in_place" in patcher_signature.parameters:
-        patcher_kwargs["in_place"] = in_place
-
-    patcher(module, **patcher_kwargs)
-
-    # Older Liger helpers may not expose in_place as a keyword, while
-    # LigerRMSNorm.forward still reads the value from the module instance.
-    module.in_place = in_place
-    module._lmms_engine_liger_rms_norm = True
-    module._lmms_engine_rms_norm_backend = "liger"
-
-    state_dict_keys_after = tuple(module.state_dict().keys())
-    if strict and state_dict_keys_after != state_dict_keys_before:
-        raise RuntimeError(
-            "Patching RMSNorm changed its state-dict keys: "
-            f"before={state_dict_keys_before}, after={state_dict_keys_after}."
-        )
-
-    return not already_patched
-
-
 def _make_torch_npu_rms_norm_forward(
     operator: Callable[..., Any],
     epsilon_attribute: str,
 ) -> Callable[..., Any]:
     def torch_npu_rms_norm_forward(module: Any, hidden_states: Any) -> Any:
-        result = operator(
-            hidden_states,
-            module.weight,
-            getattr(module, epsilon_attribute),
-        )
+        result = operator(hidden_states, module.weight, getattr(module, epsilon_attribute))
         if isinstance(result, (tuple, list)):
             if not result:
                 raise RuntimeError("torch_npu.npu_rms_norm returned an empty result.")
@@ -247,12 +175,16 @@ def _patch_torch_npu_rms_norm_module(
     module: Any,
     operator: Callable[..., Any],
 ) -> bool:
-    if not hasattr(module, "weight"):
-        raise TypeError(f"Expected an RMSNorm-like module with a weight parameter, got {type(module)!r}.")
-
-    _ensure_backend_compatible(module, "torch_npu")
+    backend = getattr(module, "_lmms_engine_rms_norm_backend", None)
+    if backend not in (None, "torch_npu"):
+        raise RuntimeError(
+            f"RMSNorm is already patched with backend={backend!r}; "
+            "only one RMSNorm backend may be enabled."
+        )
     if getattr(module, "_lmms_engine_torch_npu_rms_norm", False):
         return False
+    if not hasattr(module, "weight"):
+        raise TypeError(f"Expected an RMSNorm-like module with a weight, got {type(module)!r}.")
 
     epsilon_attribute = _rms_norm_epsilon_attribute(module)
     state_dict_keys_before = tuple(module.state_dict().keys())
@@ -263,97 +195,11 @@ def _patch_torch_npu_rms_norm_module(
     module._lmms_engine_torch_npu_rms_norm = True
     module._lmms_engine_rms_norm_backend = "torch_npu"
 
-    state_dict_keys_after = tuple(module.state_dict().keys())
-    if state_dict_keys_after != state_dict_keys_before:
-        raise RuntimeError(
-            "Patching RMSNorm changed its state-dict keys: "
-            f"before={state_dict_keys_before}, after={state_dict_keys_after}."
-        )
+    if tuple(module.state_dict().keys()) != state_dict_keys_before:
+        raise RuntimeError("Patching RMSNorm changed its state-dict keys.")
     if id(module.weight) != weight_id_before:
         raise RuntimeError("Patching RMSNorm replaced its weight parameter object.")
     return True
-
-
-@MONKEY_PATCHER.register("nanovlm", "liger")
-def apply_liger_rmsnorm_to_nanovlm(
-    model: Any = None,
-    rms_norm: bool = True,
-    rms_norm_in_place: bool = True,
-    rope: bool = False,
-    swiglu: bool = False,
-    cross_entropy: bool = False,
-    fused_linear_cross_entropy: bool = False,
-    strict: bool = True,
-    use_rmpad: bool = False,
-) -> int:
-    """Apply only Liger RMSNorm to NanoVLM's internal Qwen3 model.
-
-    Other Liger kernels are intentionally rejected for now so that enabling
-    ``trainer_args.use_liger_kernel`` has a single, attributable effect.
-    ``use_rmpad`` is accepted because the runner always forwards it, but it
-    does not alter the RMSNorm patch.
-
-    Returns:
-        Number of RMSNorm modules newly patched during this call.
-    """
-
-    del use_rmpad
-
-    if model is None:
-        raise ValueError("A constructed NanoVLM model instance is required for the Liger patch.")
-
-    unsupported = {
-        "rope": rope,
-        "swiglu": swiglu,
-        "cross_entropy": cross_entropy,
-        "fused_linear_cross_entropy": fused_linear_cross_entropy,
-    }
-    requested_unsupported = [name for name, enabled in unsupported.items() if enabled]
-    if requested_unsupported:
-        raise ValueError(
-            "The NanoVLM Liger patch currently supports RMSNorm only. "
-            f"Disable: {', '.join(requested_unsupported)}."
-        )
-
-    if not rms_norm:
-        logger.info("NanoVLM Liger RMSNorm is disabled; no modules were patched.")
-        return 0
-
-    language_model, base_model, text_model_type = _get_qwen3_base_model(
-        model, strict=strict
-    )
-    rms_norm_modules = _collect_qwen3_rms_norm_modules(base_model, strict=strict)
-    patcher = _load_liger_rms_norm_patcher()
-
-    newly_patched = 0
-    for module_name, module in rms_norm_modules:
-        try:
-            newly_patched += int(
-                _patch_rms_norm_module(
-                    module,
-                    patcher=patcher,
-                    in_place=rms_norm_in_place,
-                    strict=strict,
-                )
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Failed to apply Liger RMSNorm to {module_name}: {exc}") from exc
-
-    expected_count = 4 * len(base_model.layers) + 1
-    matched_count = len(rms_norm_modules)
-    if strict and matched_count != expected_count:
-        raise RuntimeError(
-            "Unexpected Qwen3 RMSNorm count: "
-            f"matched={matched_count}, expected={expected_count}."
-        )
-
-    logger.info(
-        "Applied NanoVLM Liger RMSNorm patch: "
-        f"text_model_type={text_model_type}, "
-        f"decoder_layers={len(base_model.layers)}, matched={matched_count}, "
-        f"newly_patched={newly_patched}, in_place={rms_norm_in_place}"
-    )
-    return newly_patched
 
 
 @MONKEY_PATCHER.register("nanovlm", "npu_rms_norm")
@@ -362,73 +208,90 @@ def apply_torch_npu_rmsnorm_to_nanovlm(
     strict: bool = True,
     use_rmpad: bool = False,
 ) -> int:
-    """Patch NanoVLM's internal Qwen3 RMSNorms with torch_npu native ops.
-
-    The patch binds a new ``forward`` method to each existing RMSNorm instance.
-    It does not replace modules or parameters, so checkpoint keys and parameter
-    identities remain stable across FSDP2 setup.
-
-    Returns:
-        Number of RMSNorm modules newly patched during this call.
-    """
+    """Patch every Qwen3 RMSNorm instance with torch_npu.npu_rms_norm."""
 
     del use_rmpad
-
     if model is None:
-        raise ValueError(
-            "A constructed NanoVLM model instance is required for the torch_npu RMSNorm patch."
-        )
+        raise ValueError("A constructed NanoVLM model is required for npu_rms_norm.")
 
-    language_model, base_model, text_model_type = _get_qwen3_base_model(
-        model, strict=strict
-    )
+    base_model, text_model_type = _get_qwen3_base_model(model, strict=strict)
     rms_norm_modules = _collect_qwen3_rms_norm_modules(base_model, strict=strict)
     expected_count = 4 * len(base_model.layers) + 1
     matched_count = len(rms_norm_modules)
     if strict and matched_count != expected_count:
         raise RuntimeError(
-            "Unexpected Qwen3 RMSNorm count: "
-            f"matched={matched_count}, expected={expected_count}."
+            f"Unexpected Qwen3 RMSNorm count: matched={matched_count}, expected={expected_count}."
         )
 
-    # Validate the complete set before mutating any module. This prevents a
-    # backend conflict or malformed module from leaving a partially patched model.
+    # Validate the full set before mutating any module.
     for module_name, module in rms_norm_modules:
-        if not hasattr(module, "weight"):
-            raise TypeError(
-                f"Cannot patch {module_name}: expected an RMSNorm-like module "
-                f"with a weight parameter, got {type(module)!r}."
-            )
         try:
-            _ensure_backend_compatible(module, "torch_npu")
+            backend = getattr(module, "_lmms_engine_rms_norm_backend", None)
+            if backend not in (None, "torch_npu"):
+                raise RuntimeError(f"RMSNorm backend is already {backend!r}.")
+            if not hasattr(module, "weight"):
+                raise TypeError(f"Expected a weight parameter, got {type(module)!r}.")
             _rms_norm_epsilon_attribute(module)
         except Exception as exc:
-            raise RuntimeError(
-                f"Cannot apply torch_npu RMSNorm to {module_name}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Cannot apply npu_rms_norm to {module_name}: {exc}") from exc
 
     operator = _load_torch_npu_rms_norm_operator()
     newly_patched = 0
     for module_name, module in rms_norm_modules:
         try:
-            newly_patched += int(
-                _patch_torch_npu_rms_norm_module(module, operator=operator)
-            )
+            newly_patched += int(_patch_torch_npu_rms_norm_module(module, operator))
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to apply torch_npu RMSNorm to {module_name}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to apply npu_rms_norm to {module_name}: {exc}") from exc
 
     logger.info(
-        "Applied NanoVLM torch_npu RMSNorm patch: "
-        f"text_model_type={text_model_type}, "
-        f"decoder_layers={len(base_model.layers)}, matched={matched_count}, "
-        f"newly_patched={newly_patched}"
+        "Applied NanoVLM npu_rms_norm patch: "
+        f"text_model_type={text_model_type}, decoder_layers={len(base_model.layers)}, "
+        f"matched={matched_count}, newly_patched={newly_patched}"
     )
     return newly_patched
 
 
+@MONKEY_PATCHER.register("nanovlm", "npu_rope")
+def apply_torch_npu_rope_to_nanovlm(
+    model: Any = None,
+    strict: bool = True,
+    use_rmpad: bool = False,
+) -> int:
+    """Replace Qwen3 RoPE with two torch_npu.npu_rotary_mul calls."""
+
+    del use_rmpad
+    if model is None:
+        raise ValueError("A constructed NanoVLM model is required for npu_rope.")
+
+    base_model, text_model_type = _get_qwen3_base_model(model, strict=strict)
+    layers = getattr(base_model, "layers", None)
+    if layers is None:
+        raise ValueError("Qwen3 base model does not expose decoder layers as model.layers.")
+
+    modeling_qwen3 = _load_qwen3_modeling_module()
+    current_forward = getattr(modeling_qwen3, "apply_rotary_pos_emb", None)
+    if not callable(current_forward):
+        raise RuntimeError("Transformers Qwen3 does not expose apply_rotary_pos_emb.")
+
+    if getattr(modeling_qwen3, "_lmms_engine_torch_npu_rope", False):
+        logger.info("NanoVLM npu_rope is already applied; no function was patched.")
+        return 0
+
+    operator = _load_torch_npu_rotary_mul_operator()
+    native_forward = make_torch_npu_apply_rotary_pos_emb(operator)
+    modeling_qwen3._lmms_engine_original_apply_rotary_pos_emb = current_forward
+    modeling_qwen3.apply_rotary_pos_emb = native_forward
+    modeling_qwen3._lmms_engine_torch_npu_rope = True
+
+    logger.info(
+        "Applied NanoVLM npu_rope patch: "
+        f"text_model_type={text_model_type}, decoder_layers={len(layers)}, "
+        "patched_functions=1"
+    )
+    return 1
+
+
 __all__ = [
-    "apply_liger_rmsnorm_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
+    "apply_torch_npu_rope_to_nanovlm",
 ]

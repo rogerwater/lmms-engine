@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from lmms_engine.models.monkey_patch import MONKEY_PATCHER
 from lmms_engine.models.nanovlm.monkey_patch import (
-    apply_liger_rmsnorm_to_nanovlm,
+    apply_torch_npu_rope_to_nanovlm,
     apply_torch_npu_rmsnorm_to_nanovlm,
 )
 
@@ -59,17 +59,6 @@ class DummyNanoVLM(nn.Module):
         self.language_model = DummyQwen3ForCausalLM()
 
 
-def fake_liger_patcher(
-    module: nn.Module,
-    offset: float = 0.0,
-    casting_mode: str = "llama",
-    in_place: bool = True,
-) -> None:
-    module.offset = offset
-    module.casting_mode = casting_mode
-    module.in_place = in_place
-
-
 def fake_torch_npu_rms_norm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -79,6 +68,36 @@ def fake_torch_npu_rms_norm(
     output = hidden_states * weight
     reciprocal_rms = torch.ones_like(hidden_states[..., :1])
     return output, reciprocal_rms
+
+
+def rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
+    first_half, second_half = hidden_states.chunk(2, dim=-1)
+    return torch.cat((-second_half, first_half), dim=-1)
+
+
+def fake_torch_npu_rotary_mul(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    return hidden_states * cos + rotate_half(hidden_states) * sin
+
+
+def reference_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor | None = None,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del position_ids
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return (
+        q * cos + rotate_half(q) * sin,
+        k * cos + rotate_half(k) * sin,
+    )
 
 
 def get_all_qwen3_norms(model: DummyNanoVLM) -> list[DummyRMSNorm]:
@@ -95,73 +114,20 @@ def get_all_qwen3_norms(model: DummyNanoVLM) -> list[DummyRMSNorm]:
     return norms
 
 
-def test_nanovlm_liger_patch_is_registered() -> None:
-    assert "nanovlm" in MONKEY_PATCHER
-    assert MONKEY_PATCHER["nanovlm"]["liger"] is apply_liger_rmsnorm_to_nanovlm
-
-
-def test_nanovlm_torch_npu_rmsnorm_patch_is_registered() -> None:
+def test_nanovlm_npu_patches_are_registered_independently() -> None:
     assert "nanovlm" in MONKEY_PATCHER
     assert (
         MONKEY_PATCHER["nanovlm"]["npu_rms_norm"]
         is apply_torch_npu_rmsnorm_to_nanovlm
     )
+    assert (
+        MONKEY_PATCHER["nanovlm"]["npu_rope"]
+        is apply_torch_npu_rope_to_nanovlm
+    )
+    assert "liger" not in MONKEY_PATCHER["nanovlm"]
 
 
-def test_nanovlm_liger_patch_only_updates_qwen3_rmsnorm_instances() -> None:
-    model = DummyNanoVLM()
-    state_dict_keys_before = tuple(model.state_dict().keys())
-    parameter_ids_before = {name: id(parameter) for name, parameter in model.named_parameters()}
-
-    with patch(
-        "lmms_engine.models.nanovlm.monkey_patch._load_liger_rms_norm_patcher",
-        return_value=fake_liger_patcher,
-    ):
-        newly_patched = apply_liger_rmsnorm_to_nanovlm(
-            model=model,
-            rms_norm=True,
-            rms_norm_in_place=True,
-            strict=True,
-        )
-
-    assert newly_patched == 9
-    assert tuple(model.state_dict().keys()) == state_dict_keys_before
-    assert {name: id(parameter) for name, parameter in model.named_parameters()} == parameter_ids_before
-
-    norms = get_all_qwen3_norms(model)
-
-    assert all(norm.in_place is True for norm in norms)
-    assert all(norm.casting_mode == "llama" for norm in norms)
-    assert all(norm._lmms_engine_liger_rms_norm is True for norm in norms)
-
-
-def test_nanovlm_liger_patch_is_idempotent_and_can_update_in_place_setting() -> None:
-    model = DummyNanoVLM()
-
-    with patch(
-        "lmms_engine.models.nanovlm.monkey_patch._load_liger_rms_norm_patcher",
-        return_value=fake_liger_patcher,
-    ):
-        first_count = apply_liger_rmsnorm_to_nanovlm(model=model, rms_norm_in_place=True)
-        second_count = apply_liger_rmsnorm_to_nanovlm(model=model, rms_norm_in_place=False)
-
-    assert first_count == 9
-    assert second_count == 0
-    assert all(norm.in_place is False for norm in get_all_qwen3_norms(model))
-
-
-def test_nanovlm_liger_patch_rejects_unvalidated_kernels() -> None:
-    model = DummyNanoVLM()
-
-    try:
-        apply_liger_rmsnorm_to_nanovlm(model=model, swiglu=True)
-    except ValueError as exc:
-        assert "supports RMSNorm only" in str(exc)
-    else:
-        raise AssertionError("Expected the NanoVLM Liger patch to reject SwiGLU")
-
-
-def test_nanovlm_torch_npu_patch_preserves_parameters_and_state_dict() -> None:
+def test_nanovlm_torch_npu_rmsnorm_patch_preserves_parameters_and_state_dict() -> None:
     model = DummyNanoVLM()
     state_dict_keys_before = tuple(model.state_dict().keys())
     parameter_ids_before = {name: id(parameter) for name, parameter in model.named_parameters()}
@@ -183,7 +149,7 @@ def test_nanovlm_torch_npu_patch_preserves_parameters_and_state_dict() -> None:
         assert norm._lmms_engine_rms_norm_backend == "torch_npu"
 
 
-def test_nanovlm_torch_npu_patch_is_idempotent() -> None:
+def test_nanovlm_torch_npu_rmsnorm_patch_is_idempotent() -> None:
     model = DummyNanoVLM()
 
     with patch(
@@ -197,9 +163,8 @@ def test_nanovlm_torch_npu_patch_is_idempotent() -> None:
     assert second_count == 0
 
 
-def test_nanovlm_torch_npu_patch_uses_nested_text_config() -> None:
+def test_nanovlm_torch_npu_rmsnorm_patch_uses_nested_text_config() -> None:
     model = DummyNanoVLM()
-    # Composite Transformers models may expose the outer NanovlmConfig here.
     model.language_model.config = SimpleNamespace(model_type="nanovlm")
 
     with patch(
@@ -215,22 +180,62 @@ def test_nanovlm_torch_npu_patch_uses_nested_text_config() -> None:
     )
 
 
-def test_nanovlm_rmsnorm_backends_are_mutually_exclusive() -> None:
+def test_nanovlm_torch_npu_rope_matches_forward_and_backward() -> None:
     model = DummyNanoVLM()
+    modeling_qwen3 = SimpleNamespace(
+        apply_rotary_pos_emb=reference_apply_rotary_pos_emb,
+    )
+    state_dict_keys_before = tuple(model.state_dict().keys())
+    parameter_ids_before = {name: id(parameter) for name, parameter in model.named_parameters()}
 
-    with patch(
-        "lmms_engine.models.nanovlm.monkey_patch._load_liger_rms_norm_patcher",
-        return_value=fake_liger_patcher,
+    with (
+        patch(
+            "lmms_engine.models.nanovlm.monkey_patch._load_qwen3_modeling_module",
+            return_value=modeling_qwen3,
+        ),
+        patch(
+            "lmms_engine.models.nanovlm.monkey_patch._load_torch_npu_rotary_mul_operator",
+            return_value=fake_torch_npu_rotary_mul,
+        ),
     ):
-        apply_liger_rmsnorm_to_nanovlm(model=model)
+        newly_patched = apply_torch_npu_rope_to_nanovlm(model=model, strict=True)
+        second_count = apply_torch_npu_rope_to_nanovlm(model=model, strict=True)
 
-    with patch(
-        "lmms_engine.models.nanovlm.monkey_patch._load_torch_npu_rms_norm_operator",
-        return_value=fake_torch_npu_rms_norm,
-    ):
-        try:
-            apply_torch_npu_rmsnorm_to_nanovlm(model=model)
-        except RuntimeError as exc:
-            assert "backend conflict" in str(exc)
-        else:
-            raise AssertionError("Expected torch_npu RMSNorm to reject a Liger-patched model")
+    assert newly_patched == 1
+    assert second_count == 0
+    assert modeling_qwen3._lmms_engine_torch_npu_rope is True
+    assert (
+        modeling_qwen3._lmms_engine_original_apply_rotary_pos_emb
+        is reference_apply_rotary_pos_emb
+    )
+    assert tuple(model.state_dict().keys()) == state_dict_keys_before
+    assert {name: id(parameter) for name, parameter in model.named_parameters()} == parameter_ids_before
+
+    q_reference = torch.randn(2, 4, 5, 8, requires_grad=True)
+    k_reference = torch.randn(2, 2, 5, 8, requires_grad=True)
+    q_native = q_reference.detach().clone().requires_grad_(True)
+    k_native = k_reference.detach().clone().requires_grad_(True)
+    cos = torch.randn(2, 5, 8)
+    sin = torch.randn(2, 5, 8)
+
+    q_expected, k_expected = reference_apply_rotary_pos_emb(
+        q_reference,
+        k_reference,
+        cos,
+        sin,
+    )
+    q_actual, k_actual = modeling_qwen3.apply_rotary_pos_emb(
+        q_native,
+        k_native,
+        cos,
+        sin,
+    )
+    torch.testing.assert_close(q_actual, q_expected)
+    torch.testing.assert_close(k_actual, k_expected)
+
+    q_gradient = torch.randn_like(q_expected)
+    k_gradient = torch.randn_like(k_expected)
+    torch.autograd.backward((q_expected, k_expected), (q_gradient, k_gradient))
+    torch.autograd.backward((q_actual, k_actual), (q_gradient, k_gradient))
+    torch.testing.assert_close(q_native.grad, q_reference.grad)
+    torch.testing.assert_close(k_native.grad, k_reference.grad)

@@ -51,7 +51,6 @@ torchrun --nproc_per_node="8" \
     trainer_args.fsdp_config.transformer_layer_cls_to_wrap=["Qwen3DecoderLayer"] \
     trainer_args.fsdp_config.reshard_after_forward=true \
     trainer_args.sp_ulysses_degree=1 \
-    trainer_args.use_liger_kernel=true \
     trainer_args.use_rmpad=true \
     trainer_args.dataloader_num_workers=0 \
     trainer_args.dataloader_prefetch_factor=null \
