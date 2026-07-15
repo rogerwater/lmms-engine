@@ -48,21 +48,16 @@ def _load_torch_npu_rms_norm_operator() -> Callable[..., Any]:
     return operator
 
 
-def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any]:
+def _config_model_type(config: Any) -> Any:
+    if isinstance(config, dict):
+        return config.get("model_type")
+    return getattr(config, "model_type", None)
+
+
+def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any, str]:
     language_model = getattr(model, "language_model", None)
     if language_model is None:
         raise ValueError("NanoVLM RMSNorm patch requires model.language_model.")
-
-    language_config = getattr(language_model, "config", None)
-    language_model_type = getattr(language_config, "model_type", None)
-    if language_model_type != "qwen3":
-        message = (
-            "NanoVLM RMSNorm patches currently support only a Qwen3 text "
-            f"backbone, but found model_type={language_model_type!r}."
-        )
-        if strict:
-            raise ValueError(message)
-        logger.warning(message)
 
     base_model_prefix = getattr(language_model, "base_model_prefix", "model")
     base_model = getattr(language_model, base_model_prefix, None)
@@ -74,7 +69,40 @@ def _get_qwen3_base_model(model: Any, strict: bool) -> tuple[Any, Any]:
             f"language_model (base_model_prefix={base_model_prefix!r})."
         )
 
-    return language_model, base_model
+    # In a composite PreTrainedModel, Transformers may expose the top-level
+    # NanovlmConfig through language_model.config after construction. The
+    # nested text_config remains the authoritative backbone configuration.
+    top_level_config = getattr(model, "config", None)
+    text_config = getattr(top_level_config, "text_config", None)
+    model_types = {
+        "model.config.text_config": _config_model_type(text_config),
+        "language_model.config": _config_model_type(
+            getattr(language_model, "config", None)
+        ),
+        "base_model.config": _config_model_type(getattr(base_model, "config", None)),
+    }
+    qwen3_class_names = {"Qwen3ForCausalLM", "Qwen3Model"}
+    class_names = {
+        "language_model": type(language_model).__name__,
+        "base_model": type(base_model).__name__,
+    }
+    is_qwen3 = "qwen3" in model_types.values() or any(
+        class_name in qwen3_class_names for class_name in class_names.values()
+    )
+    if not is_qwen3:
+        message = (
+            "NanoVLM RMSNorm patches currently support only a Qwen3 text "
+            f"backbone, but detected model_types={model_types!r}, "
+            f"class_names={class_names!r}."
+        )
+        if strict:
+            raise ValueError(message)
+        logger.warning(message)
+
+    detected_model_type = "qwen3" if is_qwen3 else str(
+        next((value for value in model_types.values() if value is not None), "unknown")
+    )
+    return language_model, base_model, detected_model_type
 
 
 def _collect_qwen3_rms_norm_modules(base_model: Any, strict: bool) -> list[tuple[str, Any]]:
@@ -291,7 +319,9 @@ def apply_liger_rmsnorm_to_nanovlm(
         logger.info("NanoVLM Liger RMSNorm is disabled; no modules were patched.")
         return 0
 
-    language_model, base_model = _get_qwen3_base_model(model, strict=strict)
+    language_model, base_model, text_model_type = _get_qwen3_base_model(
+        model, strict=strict
+    )
     rms_norm_modules = _collect_qwen3_rms_norm_modules(base_model, strict=strict)
     patcher = _load_liger_rms_norm_patcher()
 
@@ -319,7 +349,7 @@ def apply_liger_rmsnorm_to_nanovlm(
 
     logger.info(
         "Applied NanoVLM Liger RMSNorm patch: "
-        f"text_model_type={language_model.config.model_type}, "
+        f"text_model_type={text_model_type}, "
         f"decoder_layers={len(base_model.layers)}, matched={matched_count}, "
         f"newly_patched={newly_patched}, in_place={rms_norm_in_place}"
     )
@@ -349,7 +379,9 @@ def apply_torch_npu_rmsnorm_to_nanovlm(
             "A constructed NanoVLM model instance is required for the torch_npu RMSNorm patch."
         )
 
-    language_model, base_model = _get_qwen3_base_model(model, strict=strict)
+    language_model, base_model, text_model_type = _get_qwen3_base_model(
+        model, strict=strict
+    )
     rms_norm_modules = _collect_qwen3_rms_norm_modules(base_model, strict=strict)
     expected_count = 4 * len(base_model.layers) + 1
     matched_count = len(rms_norm_modules)
@@ -389,7 +421,7 @@ def apply_torch_npu_rmsnorm_to_nanovlm(
 
     logger.info(
         "Applied NanoVLM torch_npu RMSNorm patch: "
-        f"text_model_type={language_model.config.model_type}, "
+        f"text_model_type={text_model_type}, "
         f"decoder_layers={len(base_model.layers)}, matched={matched_count}, "
         f"newly_patched={newly_patched}"
     )

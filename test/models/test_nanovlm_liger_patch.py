@@ -52,7 +52,10 @@ class DummyQwen3ForCausalLM(nn.Module):
 class DummyNanoVLM(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(model_type="nanovlm")
+        self.config = SimpleNamespace(
+            model_type="nanovlm",
+            text_config=SimpleNamespace(model_type="qwen3"),
+        )
         self.language_model = DummyQwen3ForCausalLM()
 
 
@@ -192,6 +195,24 @@ def test_nanovlm_torch_npu_patch_is_idempotent() -> None:
 
     assert first_count == 9
     assert second_count == 0
+
+
+def test_nanovlm_torch_npu_patch_uses_nested_text_config() -> None:
+    model = DummyNanoVLM()
+    # Composite Transformers models may expose the outer NanovlmConfig here.
+    model.language_model.config = SimpleNamespace(model_type="nanovlm")
+
+    with patch(
+        "lmms_engine.models.nanovlm.monkey_patch._load_torch_npu_rms_norm_operator",
+        return_value=fake_torch_npu_rms_norm,
+    ):
+        newly_patched = apply_torch_npu_rmsnorm_to_nanovlm(model=model, strict=True)
+
+    assert newly_patched == 9
+    assert all(
+        norm._lmms_engine_rms_norm_backend == "torch_npu"
+        for norm in get_all_qwen3_norms(model)
+    )
 
 
 def test_nanovlm_rmsnorm_backends_are_mutually_exclusive() -> None:
