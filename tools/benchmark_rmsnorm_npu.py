@@ -16,6 +16,7 @@ gradient's storage for the input gradient.
 from __future__ import annotations
 
 import argparse
+import math
 import statistics
 import time
 from dataclasses import dataclass
@@ -108,6 +109,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rtol", type=float, default=5e-2)
     parser.add_argument("--atol", type=float, default=5e-3)
     parser.add_argument(
+        "--max-mismatch-elements",
+        type=int,
+        default=5,
+        help=(
+            "Print at most this many mismatched elements per tensor, ordered by "
+            "absolute error (default: 5; use 0 to disable element details)"
+        ),
+    )
+    parser.add_argument(
         "--check-correctness",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -120,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--iterations must be positive")
     if args.repeats <= 0:
         parser.error("--repeats must be positive")
+    if args.rtol < 0:
+        parser.error("--rtol must be non-negative")
+    if args.atol < 0:
+        parser.error("--atol must be non-negative")
+    if args.max_mismatch_elements < 0:
+        parser.error("--max-mismatch-elements must be non-negative")
     return args
 
 
@@ -160,12 +176,97 @@ def make_providers(
     return providers
 
 
-def difference_summary(actual: torch.Tensor, expected: torch.Tensor) -> str:
-    difference = (actual.detach().float() - expected.detach().float()).abs()
-    return (
-        f"max_abs_diff={difference.max().item():.6e}, "
-        f"mean_abs_diff={difference.mean().item():.6e}"
+def flat_index_to_coordinate(flat_index: int, shape: torch.Size) -> tuple[int, ...]:
+    """Convert a row-major flat index without relying on NPU unravel support."""
+
+    coordinate: list[int] = []
+    remaining = flat_index
+    for dimension in reversed(shape):
+        coordinate.append(remaining % dimension)
+        remaining //= dimension
+    return tuple(reversed(coordinate))
+
+
+def print_difference_report(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float,
+    atol: float,
+    max_mismatch_elements: int,
+) -> None:
+    """Print aggregate error metrics and the worst pointwise mismatches."""
+
+    actual_fp32 = actual.detach().float()
+    expected_fp32 = expected.detach().float()
+    signed_difference = actual_fp32 - expected_fp32
+    absolute_difference = signed_difference.abs()
+
+    difference_l2 = torch.linalg.vector_norm(signed_difference.reshape(-1)).item()
+    expected_l2 = torch.linalg.vector_norm(expected_fp32.reshape(-1)).item()
+    actual_l2 = torch.linalg.vector_norm(actual_fp32.reshape(-1)).item()
+    if expected_l2 == 0.0:
+        relative_l2 = 0.0 if difference_l2 == 0.0 else math.inf
+    else:
+        relative_l2 = difference_l2 / expected_l2
+
+    norm_product = actual_l2 * expected_l2
+    if norm_product == 0.0:
+        cosine = 1.0 if actual_l2 == 0.0 and expected_l2 == 0.0 else 0.0
+    else:
+        dot_product = torch.sum(actual_fp32.reshape(-1) * expected_fp32.reshape(-1)).item()
+        # Floating-point reductions can overshoot the mathematical range slightly.
+        cosine = max(-1.0, min(1.0, dot_product / norm_product))
+
+    close_mask = torch.isclose(
+        actual_fp32,
+        expected_fp32,
+        rtol=rtol,
+        atol=atol,
+        equal_nan=False,
     )
+    mismatch_mask = ~close_mask
+    mismatch_count = int(mismatch_mask.sum().item())
+    total_count = actual.numel()
+    mismatch_ratio = 100.0 * mismatch_count / total_count if total_count else 0.0
+
+    print(
+        f"    {name:16s} "
+        f"max_abs_diff={absolute_difference.max().item():.6e}, "
+        f"mean_abs_diff={absolute_difference.mean().item():.6e}, "
+        f"relative_l2={relative_l2:.6e}, "
+        f"cosine={cosine:.9f}, "
+        f"mismatch={mismatch_count}/{total_count} ({mismatch_ratio:.6f}%)"
+    )
+
+    details_to_print = min(mismatch_count, max_mismatch_elements)
+    if details_to_print == 0:
+        return
+
+    flat_mismatch_mask = mismatch_mask.reshape(-1)
+    mismatch_flat_indices = torch.nonzero(flat_mismatch_mask, as_tuple=False).reshape(-1)
+    mismatch_abs_diff = absolute_difference.reshape(-1)[mismatch_flat_indices]
+    _, worst_positions = torch.topk(
+        mismatch_abs_diff,
+        k=details_to_print,
+        largest=True,
+        sorted=True,
+    )
+    worst_flat_indices = mismatch_flat_indices[worst_positions].detach().cpu().tolist()
+    actual_flat = actual_fp32.reshape(-1)
+    expected_flat = expected_fp32.reshape(-1)
+
+    for rank, flat_index in enumerate(worst_flat_indices, start=1):
+        actual_value = actual_flat[flat_index].item()
+        expected_value = expected_flat[flat_index].item()
+        absolute_error = abs(actual_value - expected_value)
+        allowed_error = atol + rtol * abs(expected_value)
+        coordinate = flat_index_to_coordinate(flat_index, actual.shape)
+        print(
+            f"      mismatch[{rank}] index={coordinate}, "
+            f"actual={actual_value:.9e}, expected={expected_value:.9e}, "
+            f"abs_diff={absolute_error:.9e}, allowed={allowed_error:.9e}"
+        )
 
 
 def assert_tensor_close(
@@ -174,6 +275,7 @@ def assert_tensor_close(
     expected: torch.Tensor | None,
     rtol: float,
     atol: float,
+    max_mismatch_elements: int,
 ) -> None:
     if actual is None or expected is None:
         raise AssertionError(f"{name}: a required tensor or gradient was not produced")
@@ -181,7 +283,19 @@ def assert_tensor_close(
         raise AssertionError(f"{name}: actual tensor contains NaN or Inf")
     if not torch.isfinite(expected).all().item():
         raise AssertionError(f"{name}: expected tensor contains NaN or Inf")
-    print(f"    {name:16s} {difference_summary(actual, expected)}")
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"{name}: shape mismatch: actual={tuple(actual.shape)}, "
+            f"expected={tuple(expected.shape)}"
+        )
+    print_difference_report(
+        name=name,
+        actual=actual,
+        expected=expected,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_elements=max_mismatch_elements,
+    )
     torch.testing.assert_close(
         actual.detach().float(),
         expected.detach().float(),
@@ -198,6 +312,7 @@ def check_provider_correctness(
     base_grad_output: torch.Tensor,
     rtol: float,
     atol: float,
+    max_mismatch_elements: int,
 ) -> None:
     reference.module.zero_grad(set_to_none=True)
     candidate.module.zero_grad(set_to_none=True)
@@ -215,18 +330,35 @@ def check_provider_correctness(
     torch.npu.synchronize()
 
     print(f"  {candidate.name}")
-    assert_tensor_close("forward", candidate_output, reference_output, rtol, atol)
-    assert_tensor_close("input gradient", candidate_input.grad, reference_input.grad, rtol, atol)
-    assert_tensor_close(
-        "weight gradient",
-        candidate.module.weight.grad,
-        reference.module.weight.grad,
-        rtol,
-        atol,
+    checks = (
+        ("forward", candidate_output, reference_output),
+        ("input gradient", candidate_input.grad, reference_input.grad),
+        (
+            "weight gradient",
+            candidate.module.weight.grad,
+            reference.module.weight.grad,
+        ),
     )
+    failures: list[str] = []
+    for name, actual, expected in checks:
+        try:
+            assert_tensor_close(
+                name,
+                actual,
+                expected,
+                rtol,
+                atol,
+                max_mismatch_elements,
+            )
+        except AssertionError as exc:
+            failures.append(str(exc))
 
     reference.module.zero_grad(set_to_none=True)
     candidate.module.zero_grad(set_to_none=True)
+    if failures:
+        raise AssertionError(
+            f"{candidate.name} correctness check failed:\n" + "\n".join(failures)
+        )
 
 
 def reset_peak_memory_stats(device: torch.device) -> None:
@@ -382,6 +514,8 @@ def main() -> None:
     print(f"  warmup:         {args.warmup}")
     print(f"  iterations:     {args.iterations}")
     print(f"  repeats:        {args.repeats}")
+    print(f"  correctness:    rtol={args.rtol}, atol={args.atol}")
+    print(f"  mismatch rows:  {args.max_mismatch_elements} per tensor")
     try:
         print(f"  native schema:  {torch.ops.npu.npu_rms_norm.default._schema}")
     except Exception as exc:
@@ -391,14 +525,25 @@ def main() -> None:
         print("\nCorrectness check against pytorch_qwen3")
         reference = providers[0]
         print("  pytorch_qwen3 (reference)")
+        correctness_failures: list[str] = []
         for candidate in providers[1:]:
-            check_provider_correctness(
-                reference=reference,
-                candidate=candidate,
-                base_input=base_input,
-                base_grad_output=base_grad_output,
-                rtol=args.rtol,
-                atol=args.atol,
+            try:
+                check_provider_correctness(
+                    reference=reference,
+                    candidate=candidate,
+                    base_input=base_input,
+                    base_grad_output=base_grad_output,
+                    rtol=args.rtol,
+                    atol=args.atol,
+                    max_mismatch_elements=args.max_mismatch_elements,
+                )
+            except AssertionError as exc:
+                correctness_failures.append(str(exc))
+        if correctness_failures:
+            raise AssertionError(
+                "One or more providers failed the correctness check. "
+                "Benchmark timing was not started.\n\n"
+                + "\n\n".join(correctness_failures)
             )
         print("  PASS: all providers match the PyTorch reference.")
 
