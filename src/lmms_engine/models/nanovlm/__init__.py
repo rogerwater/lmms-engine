@@ -2,6 +2,7 @@ from lmms_engine.mapping_func import register_model
 
 from .configuration_nanovlm import NanovlmConfig
 from .monkey_patch import (
+    apply_torch_npu_cross_entropy_to_nanovlm,
     apply_torch_npu_rope_to_nanovlm,
     apply_torch_npu_rmsnorm_to_nanovlm,
 )
@@ -17,6 +18,7 @@ register_model(
 __all__ = [
     "NanovlmConfig",
     "NanovlmForConditionalGeneration",
+    "apply_torch_npu_cross_entropy_to_nanovlm",
     "apply_torch_npu_rope_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
 ]

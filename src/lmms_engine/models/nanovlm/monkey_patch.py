@@ -9,7 +9,10 @@ from loguru import logger
 
 from lmms_engine.models.monkey_patch import MONKEY_PATCHER
 
-from .npu_fused_ops import make_torch_npu_apply_rotary_pos_emb
+from .npu_fused_ops import (
+    make_torch_npu_apply_rotary_pos_emb,
+    torch_npu_active_token_causal_lm_loss,
+)
 
 
 def _load_torch_npu_operator(name: str) -> Callable[..., Any]:
@@ -33,6 +36,10 @@ def _load_torch_npu_rms_norm_operator() -> Callable[..., Any]:
 
 def _load_torch_npu_rotary_mul_operator() -> Callable[..., Any]:
     return _load_torch_npu_operator("npu_rotary_mul")
+
+
+def _load_torch_npu_cross_entropy_operator() -> Callable[..., Any]:
+    return _load_torch_npu_operator("npu_cross_entropy_loss")
 
 
 def _load_qwen3_modeling_module() -> Any:
@@ -202,6 +209,91 @@ def _patch_torch_npu_rms_norm_module(
     return True
 
 
+def _make_torch_npu_cross_entropy_forward(
+    original_forward: Callable[..., Any],
+    base_model: Any,
+    operator: Callable[..., Any],
+) -> Callable[..., Any]:
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    def torch_npu_cross_entropy_forward(
+        module: Any,
+        input_ids: Any = None,
+        attention_mask: Any = None,
+        position_ids: Any = None,
+        past_key_values: Any = None,
+        inputs_embeds: Any = None,
+        labels: Any = None,
+        use_cache: Any = None,
+        cache_position: Any = None,
+        logits_to_keep: Any = 0,
+        **kwargs: Any,
+    ) -> Any:
+        return_dict = kwargs.get(
+            "return_dict",
+            getattr(getattr(module, "config", None), "use_return_dict", True),
+        )
+        uses_full_training_logits = isinstance(logits_to_keep, int) and logits_to_keep == 0
+
+        # Preserve the exact upstream Qwen3 contract for generation, eval, tuple
+        # outputs, and uncommon callers that supply pre-shifted labels or a
+        # logits slice. NanoVLM training uses the optimized branch below.
+        if (
+            labels is None
+            or not module.training
+            or not return_dict
+            or not uses_full_training_logits
+            or "shift_labels" in kwargs
+        ):
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                logits_to_keep=logits_to_keep,
+                **kwargs,
+            )
+
+        base_model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "inputs_embeds": inputs_embeds,
+            "use_cache": use_cache,
+        }
+        if cache_position is not None:
+            base_model_kwargs["cache_position"] = cache_position
+
+        outputs = base_model(**base_model_kwargs, **kwargs)
+        hidden_states = outputs.last_hidden_state
+        loss = torch_npu_active_token_causal_lm_loss(
+            hidden_states,
+            labels,
+            module.lm_head,
+            operator,
+            ignore_index=kwargs.get("ignore_index", -100),
+            num_items_in_batch=kwargs.get("num_items_in_batch"),
+        )
+
+        # The training path intentionally does not materialize full-sequence
+        # logits. Hugging Face Trainer consumes loss here; eval and inference
+        # use the unmodified upstream path above and still receive logits.
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=None,
+            past_key_values=getattr(outputs, "past_key_values", None),
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
+    return torch_npu_cross_entropy_forward
+
+
 @MONKEY_PATCHER.register("nanovlm", "npu_rms_norm")
 def apply_torch_npu_rmsnorm_to_nanovlm(
     model: Any = None,
@@ -286,12 +378,75 @@ def apply_torch_npu_rope_to_nanovlm(
     logger.info(
         "Applied NanoVLM npu_rope patch: "
         f"text_model_type={text_model_type}, decoder_layers={len(layers)}, "
-        "patched_functions=1"
+        "patched_functions=1, backward_saved_tensors=cos_sin_only"
+    )
+    return 1
+
+
+@MONKEY_PATCHER.register("nanovlm", "npu_cross_entropy")
+def apply_torch_npu_cross_entropy_to_nanovlm(
+    model: Any = None,
+    strict: bool = True,
+    use_rmpad: bool = False,
+) -> int:
+    """Use active-token lm_head projection and torch_npu cross entropy."""
+
+    del use_rmpad
+    if model is None:
+        raise ValueError("A constructed NanoVLM model is required for npu_cross_entropy.")
+
+    base_model, text_model_type = _get_qwen3_base_model(model, strict=strict)
+    language_model = model.language_model
+
+    backend = getattr(language_model, "_lmms_engine_cross_entropy_backend", None)
+    if backend not in (None, "torch_npu"):
+        raise RuntimeError(
+            f"Cross entropy is already patched with backend={backend!r}; "
+            "only one cross-entropy backend may be enabled."
+        )
+    if getattr(language_model, "_lmms_engine_torch_npu_cross_entropy", False):
+        logger.info("NanoVLM npu_cross_entropy is already applied; no module was patched.")
+        return 0
+
+    original_forward = getattr(language_model, "forward", None)
+    lm_head = getattr(language_model, "lm_head", None)
+    if not callable(original_forward):
+        raise TypeError("NanoVLM language_model does not expose a callable forward method.")
+    if lm_head is None or not callable(lm_head):
+        raise TypeError("NanoVLM Qwen3 language_model does not expose a callable lm_head.")
+
+    state_dict_keys_before = tuple(language_model.state_dict().keys())
+    parameter_ids_before = {
+        name: id(parameter) for name, parameter in language_model.named_parameters()
+    }
+    operator = _load_torch_npu_cross_entropy_operator()
+    native_forward = _make_torch_npu_cross_entropy_forward(
+        original_forward,
+        base_model,
+        operator,
+    )
+    language_model.forward = MethodType(native_forward, language_model)
+    language_model._lmms_engine_torch_npu_cross_entropy = True
+    language_model._lmms_engine_cross_entropy_backend = "torch_npu"
+
+    if tuple(language_model.state_dict().keys()) != state_dict_keys_before:
+        raise RuntimeError("Patching cross entropy changed language_model state-dict keys.")
+    parameter_ids_after = {
+        name: id(parameter) for name, parameter in language_model.named_parameters()
+    }
+    if parameter_ids_after != parameter_ids_before:
+        raise RuntimeError("Patching cross entropy replaced language_model parameters.")
+
+    logger.info(
+        "Applied NanoVLM npu_cross_entropy patch: "
+        f"text_model_type={text_model_type}, patched_modules=1, "
+        "training_logits=active_tokens_only, loss_logits_dtype=float32"
     )
     return 1
 
 
 __all__ = [
+    "apply_torch_npu_cross_entropy_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
     "apply_torch_npu_rope_to_nanovlm",
 ]

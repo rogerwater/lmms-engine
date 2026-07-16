@@ -58,16 +58,6 @@ Download and use [NanoVLM_Init](https://huggingface.co/datasets/LMMs-Lab-Speedru
 bash ./examples/nanovlm/stage1_nanovlm_train.sh
 ```
 
-For Ascend, the native RMSNorm and RoPE optimizations are independent patches:
-
-```bash
-USE_NPU_RMS_NORM=true USE_NPU_ROPE=true \
-  bash ./examples/nanovlm/stage1_nanovlm_train_ascend.sh
-```
-
-Either variable can be disabled independently. The patch list is assembled from
-the enabled variables instead of using a single fused-optimization switch.
-
 ### 2. Merge Stage 1 Checkpoint
 
 ```bash

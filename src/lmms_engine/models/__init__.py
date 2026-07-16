@@ -11,6 +11,7 @@ from .monkey_patch import MONKEY_PATCHER
 from .nanovlm import (
     NanovlmConfig,
     NanovlmForConditionalGeneration,
+    apply_torch_npu_cross_entropy_to_nanovlm,
     apply_torch_npu_rope_to_nanovlm,
     apply_torch_npu_rmsnorm_to_nanovlm,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "MONKEY_PATCHER",
     "NanovlmConfig",
     "NanovlmForConditionalGeneration",
+    "apply_torch_npu_cross_entropy_to_nanovlm",
     "apply_torch_npu_rope_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
     "RaeSiglipConfig",
