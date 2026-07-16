@@ -114,7 +114,9 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
     def get_one_sample(self, index, data_folder=None, data_list=None):
         """Get a sample from the dataset by index."""
         if data_folder is None:
-            data_folder = self.data_folder[index]
+            all_data_folders = getattr(self, "data_folder", None)
+            if all_data_folders is not None:
+                data_folder = all_data_folders[index]
         if data_list is None:
             data_list = self.data_list
         if (
@@ -130,6 +132,33 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
         else:
             raise NotImplementedError
         return data_dict
+
+    def _overlong_filter_limit(self):
+        """Return the active per-sample token limit, or ``None`` if disabled.
+
+        ``max_length`` is the explicit sample limit. ``packing_length`` is the
+        fallback limit because existing iterable-dataset launch configs use it
+        even when online packing is disabled.
+        """
+        if not self.config.filter_overlong:
+            return None
+        max_length = getattr(self.config, "max_length", None)
+        if max_length is not None:
+            return max_length
+        return self.config.packing_length
+
+    @staticmethod
+    def _sample_token_length(data_dict):
+        """Return the number of token IDs produced for one processed sample."""
+        if "input_ids" not in data_dict:
+            raise KeyError("Processed iterable sample does not contain input_ids.")
+        input_ids = data_dict["input_ids"]
+        if not hasattr(input_ids, "numel"):
+            raise TypeError(
+                "Processed iterable sample input_ids must be a tensor-like object "
+                f"with numel(), got {type(input_ids)!r}."
+            )
+        return int(input_ids.numel())
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -150,7 +179,10 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
         end_index = start_index + per_rank_size[rank]
 
         # Shard the data according to distributed environment
-        curr_data_folder = self.data_folder[start_index:end_index]
+        all_data_folders = getattr(self, "data_folder", None)
+        curr_data_folder = (
+            all_data_folders[start_index:end_index] if all_data_folders is not None else None
+        )
         # self.data_folder = self.data_folder[start_index:end_index]
         curr_data_list = self.data_list.shard(num_shards=world_size, index=rank, contiguous=True)
 
@@ -166,8 +198,10 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
 
         # Distrbute the data to each worker
         curr_data_list = curr_data_list.select(range(iter_start, iter_end))
-        if getattr(self, "data_folder", None) is not None:
+        if curr_data_folder is not None:
             curr_data_folder = curr_data_folder[iter_start:iter_end]
+
+        filter_limit = self._overlong_filter_limit()
 
         if self.config.packing:
             # Reset index only when starting a fresh pass. When resuming from a
@@ -187,17 +221,18 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             # Iterate through the dataset once per epoch
             while self.cur_idx < len(curr_data_list):
                 try:
-                    data_dict = self.get_one_sample(self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list)
+                    data_folder = curr_data_folder[self.cur_idx] if curr_data_folder is not None else None
+                    data_dict = self.get_one_sample(self.cur_idx, data_folder, curr_data_list)
+                    data_length = self._sample_token_length(data_dict)
                 except Exception as e:
                     traceback.print_exc()
                     logger.error(f"Error getting one sample: {e}, skip this sample")
                     self.cur_idx += 1
                     continue
-                data_length = data_dict["input_ids"].shape[0]
                 self.cur_idx += 1
 
                 # Drop overlong sample if filtering is enabled
-                if data_length > packing_length and self.config.filter_overlong:
+                if filter_limit is not None and data_length > filter_limit:
                     continue
 
                 # Oversized samples bypass the packer: flush whatever is buffered
@@ -217,13 +252,18 @@ class MultiModalIterableDataset(BaseIterableDataset, MultiModalDataLoadingMixin)
             self._resuming = False
             while self.cur_idx < len(curr_data_list):
                 try:
-                    yield self.get_one_sample(self.cur_idx, curr_data_folder[self.cur_idx], curr_data_list)
+                    data_folder = curr_data_folder[self.cur_idx] if curr_data_folder is not None else None
+                    data_dict = self.get_one_sample(self.cur_idx, data_folder, curr_data_list)
+                    data_length = self._sample_token_length(data_dict)
                 except Exception as e:
                     traceback.print_exc()
                     logger.error(f"Error getting one sample: {e}, skip this sample")
                     self.cur_idx += 1
                     continue
                 self.cur_idx += 1
+                if filter_limit is not None and data_length > filter_limit:
+                    continue
+                yield data_dict
 
     def state_dict(self):
         """Stateful protocol for torchdata.StatefulDataLoader.
