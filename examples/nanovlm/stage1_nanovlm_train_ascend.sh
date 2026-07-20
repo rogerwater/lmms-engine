@@ -130,6 +130,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" \
   trainer_args.profiler_config.warmup_steps="${PROFILER_WARMUP_STEPS}" \
   trainer_args.profiler_config.end_step="${PROFILER_END_STEP}" \
   trainer_args.profiler_config.ranks="${PROFILER_RANKS}" \
-  trainer_args.report_to='[]' \
+  trainer_args.report_to='["wandb"]' \
   trainer_args.group_by_length=false \
   "${MODEL_PATCH_ARGS[@]}"
