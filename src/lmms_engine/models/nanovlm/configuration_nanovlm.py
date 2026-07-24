@@ -17,9 +17,11 @@ class NanovlmConfig(PretrainedConfig):
         vision_config: Optional[Dict[str, Any]] = None,
         text_config: Optional[Dict[str, Any]] = None,
         image_token_id: Optional[int] = None,
+        projector_type: str = "mlp",
         projector_hidden_size: Optional[int] = None,
         projector_num_layers: int = 2,
         projector_hidden_act: str = "gelu",
+        projector_bias: bool = True,
         vision_feature_dim: Optional[int] = None,
         image_token_count: int = 256,
         validate_image_token_count: bool = False,
@@ -40,13 +42,29 @@ class NanovlmConfig(PretrainedConfig):
         self.vision_model_name = vision_model_name
         self.llm_model_name = llm_model_name
         self.image_token_id = image_token_id
+        self.projector_type = str(projector_type).strip().lower()
         self.projector_hidden_size = projector_hidden_size
         self.projector_num_layers = int(projector_num_layers)
         self.projector_hidden_act = projector_hidden_act
+        self.projector_bias = bool(projector_bias)
         self.vision_feature_dim = int(vision_feature_dim or getattr(self.vision_config, "hidden_size", 1152))
         self.image_token_count = int(image_token_count)
         self.validate_image_token_count = bool(validate_image_token_count)
         self.vocab_size = getattr(self.text_config, "vocab_size", None)
+
+        supported_projector_types = {"linear", "mlp", "swiglu"}
+        if self.projector_type not in supported_projector_types:
+            raise ValueError(
+                f"Unsupported projector_type={self.projector_type!r}. "
+                f"Expected one of {sorted(supported_projector_types)}."
+            )
+        if self.projector_num_layers < 1:
+            raise ValueError("projector_num_layers must be at least 1.")
+        if self.projector_hidden_size is not None:
+            self.projector_hidden_size = int(self.projector_hidden_size)
+            if self.projector_hidden_size <= 0:
+                raise ValueError("projector_hidden_size must be positive when provided.")
+
         super().__init__(**kwargs)
 
     @staticmethod

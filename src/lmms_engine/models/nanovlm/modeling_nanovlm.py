@@ -21,6 +21,74 @@ def _build_activation(act_name: str) -> nn.Module:
     return act if isinstance(act, nn.Module) else nn.GELU()
 
 
+class NanovlmSwiGLUProjector(nn.Module):
+    """Token-wise SwiGLU adapter from the vision space to the language space."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(in_dim, 2 * hidden_dim, bias=bias)
+        self.down_proj = nn.Linear(hidden_dim, out_dim, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
+        return self.down_proj(nn.functional.silu(gate) * up)
+
+
+def build_nanovlm_projector(
+    projector_type: str,
+    in_dim: int,
+    out_dim: int,
+    hidden_dim: Optional[int] = None,
+    num_layers: int = 2,
+    act_name: str = "gelu",
+    bias: bool = True,
+) -> nn.Module:
+    """Build a NanoVLM projector while preserving legacy MLP state-dict keys."""
+
+    projector_type = projector_type.strip().lower()
+    if num_layers < 1:
+        raise ValueError("num_layers must be at least 1.")
+
+    if projector_type == "linear":
+        return nn.Linear(in_dim, out_dim, bias=bias)
+
+    hidden_dim = hidden_dim or out_dim
+    if hidden_dim <= 0:
+        raise ValueError("hidden_dim must be positive.")
+
+    if projector_type == "mlp":
+        # Preserve the legacy behavior where projector_num_layers=1 means a
+        # single Linear layer even when older configs do not have projector_type.
+        if num_layers == 1:
+            return nn.Linear(in_dim, out_dim, bias=bias)
+
+        dims = [in_dim, *([hidden_dim] * (num_layers - 1)), out_dim]
+        layers = []
+        for layer_idx, (input_dim, output_dim) in enumerate(zip(dims, dims[1:])):
+            layers.append(nn.Linear(input_dim, output_dim, bias=bias))
+            if layer_idx < num_layers - 1:
+                layers.append(_build_activation(act_name))
+        # Keep this as a direct Sequential. In particular, the default
+        # two-layer MLP retains multi_modal_projector.0.* and .2.* keys.
+        return nn.Sequential(*layers)
+
+    if projector_type == "swiglu":
+        return NanovlmSwiGLUProjector(
+            in_dim=in_dim,
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            bias=bias,
+        )
+
+    raise ValueError(f"Unsupported projector_type={projector_type!r}. Expected one of ['linear', 'mlp', 'swiglu'].")
+
+
 class NanovlmForConditionalGeneration(PreTrainedModel, GenerationMixin):
     config_class = NanovlmConfig
     supports_gradient_checkpointing = True
@@ -45,11 +113,13 @@ class NanovlmForConditionalGeneration(PreTrainedModel, GenerationMixin):
             raise ValueError("Unable to infer language model hidden size from config.")
 
         self.multi_modal_projector = self._build_projector(
-            config.vision_feature_dim,
-            llm_hidden_size,
-            config.projector_hidden_size,
-            config.projector_num_layers,
-            config.projector_hidden_act,
+            in_dim=config.vision_feature_dim,
+            out_dim=llm_hidden_size,
+            hidden_dim=config.projector_hidden_size,
+            num_layers=config.projector_num_layers,
+            act_name=config.projector_hidden_act,
+            projector_type=config.projector_type,
+            bias=config.projector_bias,
         )
 
         self.post_init()
@@ -61,15 +131,17 @@ class NanovlmForConditionalGeneration(PreTrainedModel, GenerationMixin):
         hidden_dim: Optional[int],
         num_layers: int,
         act_name: str,
+        projector_type: str = "mlp",
+        bias: bool = True,
     ) -> nn.Module:
-        if num_layers <= 1:
-            return nn.Linear(in_dim, out_dim)
-        hidden_dim = hidden_dim or out_dim
-        activation = _build_activation(act_name)
-        return nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            activation,
-            nn.Linear(hidden_dim, out_dim),
+        return build_nanovlm_projector(
+            projector_type=projector_type,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            act_name=act_name,
+            bias=bias,
         )
 
     def _encode_images(

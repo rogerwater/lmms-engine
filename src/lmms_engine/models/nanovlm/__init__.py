@@ -6,7 +6,11 @@ from .monkey_patch import (
     apply_torch_npu_rope_to_nanovlm,
     apply_torch_npu_rmsnorm_to_nanovlm,
 )
-from .modeling_nanovlm import NanovlmForConditionalGeneration
+from .modeling_nanovlm import (
+    NanovlmForConditionalGeneration,
+    NanovlmSwiGLUProjector,
+    build_nanovlm_projector,
+)
 
 register_model(
     "nanovlm",
@@ -18,6 +22,8 @@ register_model(
 __all__ = [
     "NanovlmConfig",
     "NanovlmForConditionalGeneration",
+    "NanovlmSwiGLUProjector",
+    "build_nanovlm_projector",
     "apply_torch_npu_cross_entropy_to_nanovlm",
     "apply_torch_npu_rope_to_nanovlm",
     "apply_torch_npu_rmsnorm_to_nanovlm",
